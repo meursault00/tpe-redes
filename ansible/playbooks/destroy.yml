@@ -1,0 +1,16 @@
+---
+- name: Destroy all Multipass VMs
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    nodes:
+      - k3s-master
+      - k3s-worker-1
+      - k3s-worker-2
+
+  tasks:
+    - name: Delete instances
+      command: multipass delete --purge {{ item }}
+      loop: "{{ nodes }}"

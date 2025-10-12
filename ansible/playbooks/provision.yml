@@ -1,0 +1,79 @@
+---
+- name: Provision Multipass VMs
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    nodes:
+      - name: k3s-master
+      - name: k3s-worker-1
+      - name: k3s-worker-2
+
+  tasks:
+    - name: Launch Multipass instances with cloud-init
+      command: >
+        multipass launch 22.04
+        --name {{ item.name }}
+        --cpus 2
+        --memory 2G
+        --disk 10G
+        --cloud-init "{{ playbook_dir }}/cloud-init.yml"
+      loop: "{{ nodes }}"
+      register: launch_result
+      failed_when: 
+        - launch_result.rc != 0
+        - "'already exists' not in launch_result.stderr"
+
+    - name: Wait for VMs to get IP addresses
+      pause:
+        seconds: 10
+
+    - name: Get IP addresses for all VMs
+      command: multipass info {{ item.name }} --format json
+      loop: "{{ nodes }}"
+      register: vm_info
+      changed_when: false
+
+    - name: Parse IP addresses
+      set_fact:
+        vm_ips: >-
+          {{
+            vm_ips | default({}) | combine({
+              item.item.name: (item.stdout | from_json).info[item.item.name].ipv4[0]
+            })
+          }}
+      loop: "{{ vm_info.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Display detected IP addresses
+      debug:
+        msg: "{{ item.key }}: {{ item.value }}"
+      loop: "{{ vm_ips | dict2items }}"
+
+    - name: Generate inventory file
+      copy:
+        content: |
+          all:
+            vars:
+              ansible_python_interpreter: /usr/bin/python3
+              ansible_user: ubuntu
+              ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
+
+            children:
+              master:
+                hosts:
+                  k3s-master:
+                    ansible_host: {{ vm_ips['k3s-master'] }}
+              workers:
+                hosts:
+                  k3s-worker-1:
+                    ansible_host: {{ vm_ips['k3s-worker-1'] }}
+                  k3s-worker-2:
+                    ansible_host: {{ vm_ips['k3s-worker-2'] }}
+        dest: "{{ playbook_dir }}/../inventory.yml"
+      
+    - name: Inventory file updated
+      debug:
+        msg: "Inventory file has been updated with the following IPs: {{ vm_ips }}"

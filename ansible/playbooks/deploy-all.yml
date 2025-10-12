@@ -1,0 +1,45 @@
+---
+- name: Setup SSH access
+  import_playbook: setup-ssh.yml
+
+- name: Provision Multipass VMs and update inventory
+  import_playbook: provision.yml
+
+- name: Wait for VMs to be ready
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Wait for VMs to fully initialize
+      pause:
+        seconds: 60
+
+- name: Setup K3s control plane
+  import_playbook: control-plane.yml
+
+- name: Join worker nodes
+  import_playbook: join-workers.yml
+
+- name: Verify cluster
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Get cluster status
+      command: multipass exec k3s-master -- sudo kubectl get nodes
+      register: cluster_status
+      changed_when: false
+    
+    - name: Display cluster status
+      debug:
+        msg: "{{ cluster_status.stdout_lines }}"
+    
+    - name: Deployment complete
+      debug:
+        msg: |
+          ✅ K3s cluster deployment complete!
+          
+          Access your cluster:
+            multipass exec k3s-master -- sudo kubectl get nodes
+            multipass exec k3s-master -- sudo kubectl get pods -A
+          
+          SSH into nodes:
+            ssh -i ~/.ssh/multipass_id_rsa ubuntu@<node-ip>

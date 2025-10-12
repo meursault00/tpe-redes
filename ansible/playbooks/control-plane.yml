@@ -1,0 +1,6 @@
+---
+- name: Install K3s master
+  hosts: master
+  become: true
+  roles:
+    - master

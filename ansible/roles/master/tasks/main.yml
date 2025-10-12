@@ -1,83 +1,22 @@
 ---
-# Role: master
-# Purpose: Install and configure k3s master (control plane) node
-
-- name: Check if k3s is already installed
-  ansible.builtin.stat:
-    path: /usr/local/bin/k3s
-  register: k3s_installed
-
-- name: Download k3s install script
-  ansible.builtin.get_url:
-    url: https://get.k3s.io
-    dest: /tmp/k3s-install.sh
-    mode: '0755'
-  when: not k3s_installed.stat.exists
-
-- name: Install k3s server
-  ansible.builtin.shell: |
-    curl -sfL https://get.k3s.io | sh -s - server \
-      --write-kubeconfig-mode=644 \
-      {{ k3s_server_options | default([]) | join(' ') }}
+- name: Install k3s on master
+  shell: curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
   args:
-    creates: /etc/rancher/k3s/k3s.yaml
-  environment:
-    INSTALL_K3S_VERSION: "{{ k3s_version | default('') }}"
+    creates: /usr/local/bin/k3s
 
 - name: Wait for k3s to be ready
-  ansible.builtin.wait_for:
-    path: /etc/rancher/k3s/k3s.yaml
-    timeout: 300
+  wait_for:
+    path: /var/lib/rancher/k3s/server/node-token
+    timeout: 120
 
-- name: Wait for k3s service to be active
-  ansible.builtin.systemd:
-    name: k3s
-    state: started
-    enabled: yes
-
-- name: Wait for node to be ready
-  ansible.builtin.command: kubectl get nodes {{ inventory_hostname }}
-  register: node_status
-  until: "'Ready' in node_status.stdout"
-  retries: 30
-  delay: 10
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-  changed_when: false
-
-- name: Get k3s node token
-  ansible.builtin.slurp:
+- name: Get join token
+  slurp:
     src: /var/lib/rancher/k3s/server/node-token
-  register: k3s_token_raw
+  register: node_token
 
-- name: Store k3s token as fact
-  ansible.builtin.set_fact:
-    k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
-
-- name: Get master node IP
-  ansible.builtin.set_fact:
-    k3s_master_ip: "{{ ansible_host | default(inventory_hostname) }}"
-
-- name: Display master installation status
-  ansible.builtin.debug:
-    msg:
-      - "k3s master installed successfully on {{ inventory_hostname }}"
-      - "Master IP: {{ k3s_master_ip }}"
-      - "Token saved for worker nodes"
-
-- name: Create kubeconfig directory for ubuntu user
-  ansible.builtin.file:
-    path: /home/ubuntu/.kube
-    state: directory
-    owner: ubuntu
-    group: ubuntu
-    mode: '0755'
-
-- name: Copy kubeconfig for ubuntu user
-  ansible.builtin.copy:
-    src: /etc/rancher/k3s/k3s.yaml
-    dest: /home/ubuntu/.kube/config
-    owner: ubuntu
-    group: ubuntu
-    mode: '0600'
-    remote_src: yes
+- name: Save join token locally
+  copy:
+    content: "{{ node_token.content | b64decode }}"
+    dest: "{{ playbook_dir }}/join-token.txt"
+  delegate_to: localhost
+  become: false

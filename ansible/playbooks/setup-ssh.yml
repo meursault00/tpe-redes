@@ -1,0 +1,50 @@
+---
+- name: Setup SSH key for Multipass VMs
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  vars:
+    multipass_key_source: /var/root/Library/Application Support/multipassd/ssh-keys/id_rsa
+    multipass_key_dest: "{{ ansible_env.HOME }}/.ssh/multipass_id_rsa"
+  
+  tasks:
+    - name: Check if multipass key already exists in user .ssh
+      stat:
+        path: "{{ multipass_key_dest }}"
+      register: key_exists
+    
+    - name: Display message if key needs to be copied
+      debug:
+        msg: |
+          ⚠️  Multipass SSH key needs to be copied to your user directory.
+          Please run this command manually:
+          
+          sudo cp "/var/root/Library/Application Support/multipassd/ssh-keys/id_rsa" ~/.ssh/multipass_id_rsa && \
+          sudo chown $(whoami):staff ~/.ssh/multipass_id_rsa && \
+          chmod 600 ~/.ssh/multipass_id_rsa
+          
+          Then re-run this playbook.
+      when: not key_exists.stat.exists
+    
+    - name: Fail if key doesn't exist
+      fail:
+        msg: "Multipass SSH key not found. Please copy it manually using the command above."
+      when: not key_exists.stat.exists
+    
+    - name: Verify key permissions
+      file:
+        path: "{{ multipass_key_dest }}"
+        mode: '0600'
+      when: key_exists.stat.exists
+    
+    - name: Verify key is readable
+      command: ssh-keygen -l -f "{{ multipass_key_dest }}"
+      register: key_verify
+      changed_when: false
+      when: key_exists.stat.exists
+    
+    - name: Display key fingerprint
+      debug:
+        msg: "✅ SSH key setup complete. Fingerprint: {{ key_verify.stdout }}"
+      when: key_exists.stat.exists

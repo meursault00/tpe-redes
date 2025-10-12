@@ -1,0 +1,50 @@
+---
+# Role: worker
+# Purpose: Install and configure k3s worker (agent) nodes
+
+- name: Check if k3s-agent is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s-agent
+  register: k3s_agent_installed
+
+- name: Get k3s token from master
+  ansible.builtin.set_fact:
+    k3s_token: "{{ hostvars[groups['master'][0]]['k3s_token'] }}"
+    k3s_master_ip: "{{ hostvars[groups['master'][0]]['k3s_master_ip'] }}"
+
+- name: Display connection info
+  ansible.builtin.debug:
+    msg:
+      - "Joining {{ inventory_hostname }} to cluster"
+      - "Master IP: {{ k3s_master_ip }}"
+
+- name: Download k3s install script
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+  when: not k3s_agent_installed.stat.exists
+
+- name: Install k3s agent
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | K3S_URL=https://{{ k3s_master_ip }}:6443 \
+      K3S_TOKEN={{ k3s_token }} \
+      sh -s - agent {{ k3s_agent_options | default([]) | join(' ') }}
+  args:
+    creates: /usr/local/bin/k3s-agent
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version | default('') }}"
+
+- name: Wait for k3s-agent service to be active
+  ansible.builtin.systemd:
+    name: k3s-agent
+    state: started
+    enabled: yes
+
+- name: Wait for node to register with master
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: Display worker installation status
+  ansible.builtin.debug:
+    msg: "k3s-agent installed successfully on {{ inventory_hostname }}"
