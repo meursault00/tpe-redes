@@ -1,0 +1,64 @@
+# Ansible
+*.retry
+ansible.log
+.vault_pass
+*.pyc
+__pycache__/
+
+# Fact caching
+/tmp/ansible_facts/
+
+# Logs
+*.log
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Mac OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Kubeconfig files
+kubeconfig
+*.kubeconfig
+k3s.yaml
+
+# Secrets and tokens
+secrets/
+*.token
+.env
+
+# Backups
+*.bak
+*.backup
+
+# Python virtual environments
+venv/
+env/
+.venv/
+
+# Terraform (if integrated later)
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+
+# Documentation build artifacts
+docs/_build/
+site/

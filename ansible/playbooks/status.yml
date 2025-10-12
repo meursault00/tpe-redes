@@ -1,0 +1,73 @@
+---
+# Playbook: status.yml
+# Purpose: Check cluster status and health
+# This playbook provides comprehensive cluster health information
+
+- name: Check cluster status
+  hosts: master
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Get cluster nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: cluster_nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display cluster nodes
+      ansible.builtin.debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+
+    - name: Get all pods across namespaces
+      ansible.builtin.command: kubectl get pods --all-namespaces -o wide
+      register: cluster_pods
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display cluster pods
+      ansible.builtin.debug:
+        msg: "{{ cluster_pods.stdout_lines }}"
+
+    - name: Get cluster services
+      ansible.builtin.command: kubectl get services --all-namespaces
+      register: cluster_services
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display cluster services
+      ansible.builtin.debug:
+        msg: "{{ cluster_services.stdout_lines }}"
+
+    - name: Get cluster info
+      ansible.builtin.command: kubectl cluster-info
+      register: cluster_info
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display cluster info
+      ansible.builtin.debug:
+        msg: "{{ cluster_info.stdout_lines }}"
+
+    - name: Get k3s version
+      ansible.builtin.command: k3s --version
+      register: k3s_version
+
+    - name: Display k3s version
+      ansible.builtin.debug:
+        msg: "{{ k3s_version.stdout_lines }}"
+
+- name: Check worker node status
+  hosts: workers
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check k3s agent status
+      ansible.builtin.systemd:
+        name: k3s-agent
+      register: agent_status
+
+    - name: Display agent status
+      ansible.builtin.debug:
+        msg: "k3s-agent on {{ inventory_hostname }}: {{ agent_status.status.ActiveState }}"

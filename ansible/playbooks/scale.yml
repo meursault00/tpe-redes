@@ -1,0 +1,70 @@
+---
+# Playbook: scale.yml
+# Purpose: Scale the cluster by adding or removing worker nodes
+# Usage: ansible-playbook scale.yml -e "action=add" or "action=remove"
+
+- name: Scale cluster
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: action
+      prompt: "Enter action (add/remove)"
+      private: no
+      default: "add"
+
+    - name: node_count
+      prompt: "Enter number of nodes"
+      private: no
+      default: "1"
+
+  tasks:
+    - name: Display scaling action
+      ansible.builtin.debug:
+        msg: "{{ action | capitalize }} {{ node_count }} worker node(s)"
+
+    - name: Add new worker nodes
+      block:
+        - name: Create new Multipass VMs
+          ansible.builtin.shell: |
+            for i in $(seq 1 {{ node_count }}); do
+              LAST_WORKER=$(multipass list --format csv | grep k3s-worker | wc -l)
+              NEW_WORKER=$((LAST_WORKER + i))
+              multipass launch --name k3s-worker-${NEW_WORKER} --cpus 2 --memory 2G --disk 10G jammy
+            done
+          register: vm_creation
+
+        - name: Display VM creation result
+          ansible.builtin.debug:
+            msg: "{{ vm_creation.stdout_lines }}"
+      when: action == "add"
+
+    - name: Remove worker nodes
+      block:
+        - name: Warning about node removal
+          ansible.builtin.debug:
+            msg: "WARNING: This will remove worker nodes. Ensure pods are drained first!"
+
+        - name: Remove last N worker nodes
+          ansible.builtin.shell: |
+            WORKERS=$(multipass list --format csv | grep k3s-worker | tail -n {{ node_count }} | cut -d',' -f1)
+            for worker in $WORKERS; do
+              echo "Removing $worker"
+              multipass stop $worker
+              multipass delete $worker
+            done
+            multipass purge
+          register: vm_removal
+
+        - name: Display VM removal result
+          ansible.builtin.debug:
+            msg: "{{ vm_removal.stdout_lines }}"
+      when: action == "remove"
+
+- name: Configure new worker nodes (when adding)
+  hosts: workers
+  become: true
+  gather_facts: true
+  roles:
+    - worker
+  when: hostvars['localhost']['action'] == 'add'
