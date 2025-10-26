@@ -67,7 +67,7 @@ This project provides a complete automation solution for deploying and managing 
 
 4. **Install cluster**
    ```bash
-   ansible-playbook playbooks/install.yml
+   ansible-playbook playbooks/deploy-all.yml
    ```
 
 5. **Check status**
@@ -81,7 +81,7 @@ This project provides a complete automation solution for deploying and managing 
 .
 ├── ansible/
 │   ├── playbooks/          # Ansible playbooks
-│   │   ├── install.yml     # Complete cluster installation
+│   │   ├── deploy-all.yml  # Complete cluster installation
 │   │   ├── scale.yml       # Scale cluster up/down
 │   │   ├── status.yml      # Check cluster health
 │   │   └── uninstall.yml   # Remove k3s completely
@@ -108,11 +108,11 @@ This project provides a complete automation solution for deploying and managing 
 
 ### Install Cluster
 
-Complete installation (common setup + master + workers):
+Complete installation (provision VMs + setup SSH + install k3s on master + join workers):
 
 ```bash
 cd ansible
-ansible-playbook playbooks/install.yml
+ansible-playbook playbooks/deploy-all.yml
 ```
 
 ### Check Status
@@ -181,11 +181,11 @@ Complete cleanup of all resources:
 
 - **Control Plane (Master)**: 1 node running k3s server
   - API Server, Scheduler, Controller Manager, etcd
-  - IP: 192.168.64.10
+  - IP: 192.168.64.20
 
 - **Worker Nodes**: 2+ nodes running k3s agents
   - kubelet, kube-proxy, containerd
-  - IPs: 192.168.64.11+
+  - IPs: 192.168.64.21, 192.168.64.22
 
 - **Network**:
   - Host: 192.168.64.0/24
@@ -245,7 +245,7 @@ ansible master -m shell -a "kubectl get nodes"
 ansible master -m shell -a "cat /var/lib/rancher/k3s/server/node-token"
 
 # Manually test connection from worker
-multipass exec k3s-worker-1 -- curl -k https://192.168.64.10:6443
+multipass exec k3s-worker-1 -- curl -k https://192.168.64.20:6443
 ```
 
 ## Development

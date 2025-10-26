@@ -8,10 +8,10 @@ all:
     master:
       hosts:
         k3s-master:
-          ansible_host: 192.168.64.21
+          ansible_host: 192.168.64.20
     workers:
       hosts:
         k3s-worker-1:
-          ansible_host: 192.168.64.22
+          ansible_host: 192.168.64.21
         k3s-worker-2:
-          ansible_host: 192.168.64.23
+          ansible_host: 192.168.64.22
