@@ -1,70 +1,589 @@
 ---
 # Playbook: scale.yml
-# Purpose: Scale the cluster by adding or removing worker nodes
-# Usage: ansible-playbook scale.yml -e "action=add" or "action=remove"
+# Purpose: Scale the k3s cluster by adding or removing worker nodes
+# Usage (run from ansible/ directory):
+#   Add workers:    ansible-playbook -i inventory.yml playbooks/scale.yml -e "action=add node_count=2"
+#   Remove workers: ansible-playbook -i inventory.yml playbooks/scale.yml -e "action=remove node_count=1"
 
-- name: Scale cluster
+# ==============================================================================
+# PLAY 1: Initialize and Validate
+# ==============================================================================
+- name: Initialize scaling operation
   hosts: localhost
   gather_facts: false
 
-  vars_prompt:
-    - name: action
-      prompt: "Enter action (add/remove)"
-      private: no
-      default: "add"
-
-    - name: node_count
-      prompt: "Enter number of nodes"
-      private: no
-      default: "1"
+  vars:
+    action: "{{ action | default('add') }}"
+    node_count: "{{ node_count | default(1) | int }}"
+    inventory_path: "{{ playbook_dir }}/../inventory.yml"
+    ssh_key_path: "~/.ssh/multipass_id_rsa"
 
   tasks:
-    - name: Display scaling action
+    - name: Validate action parameter
+      ansible.builtin.assert:
+        that:
+          - action in ['add', 'remove']
+        fail_msg: "action must be either 'add' or 'remove'"
+        success_msg: "Action validated: {{ action }}"
+
+    - name: Validate node_count parameter
+      ansible.builtin.assert:
+        that:
+          - node_count | int > 0
+          - node_count | int <= 10
+        fail_msg: "node_count must be between 1 and 10"
+        success_msg: "Node count validated: {{ node_count }}"
+
+    - name: Get current cluster state
+      ansible.builtin.shell: |
+        multipass list --format csv | grep k3s-worker | wc -l
+      register: current_workers
+      changed_when: false
+
+    - name: Set current worker count fact
+      ansible.builtin.set_fact:
+        current_worker_count: "{{ current_workers.stdout | int }}"
+
+    - name: Display scaling plan
       ansible.builtin.debug:
-        msg: "{{ action | capitalize }} {{ node_count }} worker node(s)"
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║            K3S CLUSTER SCALING OPERATION               ║
+          ╚════════════════════════════════════════════════════════╝
 
-    - name: Add new worker nodes
-      block:
-        - name: Create new Multipass VMs
-          ansible.builtin.shell: |
-            for i in $(seq 1 {{ node_count }}); do
-              LAST_WORKER=$(multipass list --format csv | grep k3s-worker | wc -l)
-              NEW_WORKER=$((LAST_WORKER + i))
-              multipass launch --name k3s-worker-${NEW_WORKER} --cpus 2 --memory 2G --disk 10G jammy
-            done
-          register: vm_creation
+          Action:           {{ action | upper }}
+          Nodes affected:   {{ node_count }}
+          Current workers:  {{ current_worker_count }}
+          Target workers:   {{ (current_worker_count | int + node_count | int) if action == 'add' else (current_worker_count | int - node_count | int) }}
 
-        - name: Display VM creation result
-          ansible.builtin.debug:
-            msg: "{{ vm_creation.stdout_lines }}"
-      when: action == "add"
-
-    - name: Remove worker nodes
-      block:
-        - name: Warning about node removal
-          ansible.builtin.debug:
-            msg: "WARNING: This will remove worker nodes. Ensure pods are drained first!"
-
-        - name: Remove last N worker nodes
-          ansible.builtin.shell: |
-            WORKERS=$(multipass list --format csv | grep k3s-worker | tail -n {{ node_count }} | cut -d',' -f1)
-            for worker in $WORKERS; do
-              echo "Removing $worker"
-              multipass stop $worker
-              multipass delete $worker
-            done
-            multipass purge
-          register: vm_removal
-
-        - name: Display VM removal result
-          ansible.builtin.debug:
-            msg: "{{ vm_removal.stdout_lines }}"
+    - name: Validate scale down operation
+      ansible.builtin.assert:
+        that:
+          - (current_worker_count | int) - (node_count | int) >= 0
+        fail_msg: "Cannot remove {{ node_count }} workers - only {{ current_worker_count }} exist"
       when: action == "remove"
 
-- name: Configure new worker nodes (when adding)
+# ==============================================================================
+# PLAY 2: Scale UP - Create new VMs
+# ==============================================================================
+- name: Create new worker VMs
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+    node_count: "{{ node_count | default(1) | int }}"
+
+  tasks:
+    - name: Get current worker list
+      ansible.builtin.shell: |
+        multipass list --format csv | grep k3s-worker | cut -d',' -f1 | sort
+      register: existing_workers
+      changed_when: false
+      when: action == "add"
+
+    - name: Calculate next worker number
+      ansible.builtin.set_fact:
+        last_worker_num: >-
+          {{
+            (existing_workers.stdout_lines |
+             map('regex_replace', '^k3s-worker-', '') |
+             map('int') |
+             max | default(0))
+          }}
+      when: action == "add"
+
+    - name: Create new Multipass VMs with cloud-init
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          WORKER_NUM=$(( {{ last_worker_num | int }} + {{ item }} ))
+          WORKER_NAME="k3s-worker-${WORKER_NUM}"
+
+          echo "Creating ${WORKER_NAME}..."
+
+          multipass launch \
+            --name "${WORKER_NAME}" \
+            --cpus 2 \
+            --memory 2G \
+            --disk 10G \
+            --cloud-init "{{ playbook_dir }}/cloud-init.yml" \
+            jammy
+
+          echo "Waiting for ${WORKER_NAME} to be ready..."
+          sleep 15
+
+          # Wait for VM to be fully running
+          while [ "$(multipass info "${WORKER_NAME}" --format csv | tail -n1 | cut -d',' -f2)" != "Running" ]; do
+            echo "Waiting for ${WORKER_NAME} to reach Running state..."
+            sleep 5
+          done
+
+          # Get the VM's IP address (retry up to 6 times)
+          for i in {1..6}; do
+            IP=$(multipass info "${WORKER_NAME}" --format csv | tail -n1 | cut -d',' -f3)
+            if [ -n "$IP" ] && [ "$IP" != "--" ]; then
+              echo "${WORKER_NAME}:${IP}"
+              exit 0
+            fi
+            echo "Waiting for IP address (attempt $i/6)..."
+            sleep 5
+          done
+
+          echo "ERROR: Failed to get IP for ${WORKER_NAME}"
+          exit 1
+      register: vm_creation
+      loop: "{{ range(1, node_count | int + 1) | list }}"
+      when: action == "add"
+
+    - name: Parse new worker information
+      ansible.builtin.set_fact:
+        new_workers: >-
+          {{
+            vm_creation.results |
+            map(attribute='stdout_lines') |
+            map('last') |
+            map('split', ':') |
+            list
+          }}
+      when: action == "add"
+
+    - name: Display created VMs
+      ansible.builtin.debug:
+        msg: |
+          Created new workers:
+          {% for worker in new_workers %}
+          - {{ worker[0] }}: {{ worker[1] }}
+          {% endfor %}
+      when: action == "add"
+
+# ==============================================================================
+# PLAY 3: Scale UP - Update inventory with new workers
+# ==============================================================================
+- name: Update inventory with new workers
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+    inventory_path: "{{ playbook_dir }}/../inventory.yml"
+    ansible_user: "ubuntu"
+    ssh_key_path: "~/.ssh/multipass_id_rsa"
+
+  tasks:
+    - name: Read current inventory
+      ansible.builtin.slurp:
+        src: "{{ inventory_path }}"
+      register: inventory_content
+      when: action == "add"
+
+    - name: Parse inventory YAML
+      ansible.builtin.set_fact:
+        inventory_data: "{{ inventory_content.content | b64decode | from_yaml }}"
+      when: action == "add"
+
+    - name: Build new workers dictionary
+      ansible.builtin.set_fact:
+        new_workers_dict: >-
+          {{
+            new_workers_dict | default({}) | combine({
+              item[0]: {
+                'ansible_host': item[1]
+              }
+            })
+          }}
+      loop: "{{ new_workers }}"
+      when: action == "add"
+
+    - name: Merge new workers into inventory
+      ansible.builtin.set_fact:
+        updated_inventory: >-
+          {{
+            inventory_data | combine({
+              'all': {
+                'vars': inventory_data.all.vars,
+                'children': {
+                  'master': inventory_data.all.children.master,
+                  'workers': {
+                    'hosts': inventory_data.all.children.workers.hosts | combine(new_workers_dict)
+                  }
+                }
+              }
+            }, recursive=True)
+          }}
+      when: action == "add"
+
+    - name: Write updated inventory
+      ansible.builtin.copy:
+        content: "{{ updated_inventory | to_nice_yaml(indent=2) }}"
+        dest: "{{ inventory_path }}"
+        backup: yes
+      when: action == "add"
+
+    - name: Display inventory update
+      ansible.builtin.debug:
+        msg: "✅ Updated inventory.yml with {{ new_workers | length }} new worker(s)"
+      when: action == "add"
+
+    - name: Refresh Ansible inventory
+      ansible.builtin.meta: refresh_inventory
+      when: action == "add"
+
+    - name: Wait for inventory refresh
+      ansible.builtin.pause:
+        seconds: 5
+      when: action == "add"
+
+# ==============================================================================
+# PLAY 4: Scale UP - Configure new workers (common role)
+# ==============================================================================
+- name: Prepare new workers with common configuration
   hosts: workers
   become: true
   gather_facts: true
-  roles:
-    - worker
-  when: hostvars['localhost']['action'] == 'add'
+  serial: 1
+
+  vars:
+    action: "{{ hostvars['localhost']['action'] | default('add') }}"
+    ansible_roles_path: "{{ playbook_dir }}/../roles"
+
+  tasks:
+    - name: Check if node is newly added
+      ansible.builtin.set_fact:
+        is_new_node: "{{ inventory_hostname in hostvars['localhost']['new_workers'] | map(attribute='0') | list }}"
+      when: action == "add"
+
+    - name: Display node status
+      ansible.builtin.debug:
+        msg: "Processing {{ inventory_hostname }}: {{ 'NEW NODE' if is_new_node else 'EXISTING NODE (skipping)' }}"
+      when: action == "add"
+
+    - name: Include common role for new nodes
+      ansible.builtin.include_role:
+        name: common
+      when:
+        - action == "add"
+        - is_new_node | default(false)
+
+# ==============================================================================
+# PLAY 5: Scale UP - Join new workers to cluster
+# ==============================================================================
+- name: Join new workers to k3s cluster
+  hosts: workers
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    action: "{{ hostvars['localhost']['action'] | default('add') }}"
+    ansible_roles_path: "{{ playbook_dir }}/../roles"
+
+  tasks:
+    - name: Check if node is newly added
+      ansible.builtin.set_fact:
+        is_new_node: "{{ inventory_hostname in hostvars['localhost']['new_workers'] | map(attribute='0') | list }}"
+      when: action == "add"
+
+    - name: Include worker role for new nodes
+      ansible.builtin.include_role:
+        name: worker
+      when:
+        - action == "add"
+        - is_new_node | default(false)
+
+    - name: Wait for new node to be ready
+      ansible.builtin.pause:
+        seconds: 15
+      when:
+        - action == "add"
+        - is_new_node | default(false)
+
+# ==============================================================================
+# PLAY 6: Scale UP - Verify new workers joined
+# ==============================================================================
+- name: Verify new workers joined cluster
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+    inventory_path: "{{ playbook_dir }}/../inventory.yml"
+
+  tasks:
+    - name: Get cluster node status
+      ansible.builtin.shell: |
+        multipass exec k3s-master -- sudo kubectl get nodes -o wide
+      register: cluster_nodes
+      changed_when: false
+      when: action == "add"
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║              CLUSTER STATUS AFTER SCALE UP             ║
+          ╚════════════════════════════════════════════════════════╝
+
+          {{ cluster_nodes.stdout }}
+      when: action == "add"
+
+    - name: Verify all new nodes are Ready
+      ansible.builtin.shell: |
+        NODE_NAME="{{ item[0] }}"
+        STATUS=$(multipass exec k3s-master -- sudo kubectl get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+        if [ "$STATUS" = "True" ]; then
+          echo "✅ ${NODE_NAME} is Ready"
+          exit 0
+        else
+          echo "❌ ${NODE_NAME} is not Ready (status: ${STATUS})"
+          exit 1
+        fi
+      loop: "{{ new_workers }}"
+      register: node_verification
+      changed_when: false
+      when: action == "add"
+
+    - name: Scale up summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║           SCALE UP COMPLETED SUCCESSFULLY              ║
+          ╚════════════════════════════════════════════════════════╝
+
+          ✅ Added {{ new_workers | length }} worker node(s)
+          ✅ All nodes joined cluster and are Ready
+          ✅ Inventory updated: {{ inventory_path }}
+
+          New workers:
+          {% for worker in new_workers %}
+          - {{ worker[0] }} ({{ worker[1] }})
+          {% endfor %}
+
+          Next steps:
+          - Verify: kubectl get nodes
+          - Check pods: kubectl get pods -A
+      when: action == "add"
+
+# ==============================================================================
+# PLAY 7: Scale DOWN - Drain and remove nodes from k3s
+# ==============================================================================
+- name: Prepare workers for removal
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+    node_count: "{{ node_count | default(1) | int }}"
+
+  tasks:
+    - name: Get workers to remove
+      ansible.builtin.shell: |
+        multipass list --format csv | grep k3s-worker | tail -n {{ node_count }} | cut -d',' -f1
+      register: workers_to_remove
+      changed_when: false
+      when: action == "remove"
+
+    - name: Set workers to remove fact
+      ansible.builtin.set_fact:
+        removal_workers: "{{ workers_to_remove.stdout_lines }}"
+      when: action == "remove"
+
+    - name: Display removal plan
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║          PREPARING TO REMOVE WORKER NODES              ║
+          ╚════════════════════════════════════════════════════════╝
+
+          Workers to remove:
+          {% for worker in removal_workers %}
+          - {{ worker }}
+          {% endfor %}
+      when: action == "remove"
+
+    - name: Drain pods from workers
+      ansible.builtin.shell: |
+        WORKER="{{ item }}"
+        echo "Draining pods from ${WORKER}..."
+        multipass exec k3s-master -- sudo kubectl drain "${WORKER}" \
+          --ignore-daemonsets \
+          --delete-emptydir-data \
+          --force \
+          --grace-period=30 \
+          --timeout=120s || true
+        echo "✅ ${WORKER} drained"
+      loop: "{{ removal_workers }}"
+      register: drain_result
+      when: action == "remove"
+
+    - name: Wait for pods to evacuate
+      ansible.builtin.pause:
+        seconds: 20
+        prompt: "Waiting for pods to evacuate from nodes..."
+      when: action == "remove"
+
+    - name: Delete nodes from k3s cluster
+      ansible.builtin.shell: |
+        WORKER="{{ item }}"
+        echo "Removing ${WORKER} from k3s cluster..."
+        multipass exec k3s-master -- sudo kubectl delete node "${WORKER}" || true
+        echo "✅ ${WORKER} removed from cluster"
+      loop: "{{ removal_workers }}"
+      register: delete_result
+      when: action == "remove"
+
+    - name: Display drain results
+      ansible.builtin.debug:
+        msg: |
+          ✅ Drained and removed {{ removal_workers | length }} node(s) from k3s cluster
+      when: action == "remove"
+
+# ==============================================================================
+# PLAY 8: Scale DOWN - Delete VMs
+# ==============================================================================
+- name: Delete worker VMs
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+
+  tasks:
+    - name: Stop and delete VMs
+      ansible.builtin.shell: |
+        WORKER="{{ item }}"
+        echo "Stopping ${WORKER}..."
+        multipass stop "${WORKER}"
+        echo "Deleting ${WORKER}..."
+        multipass delete "${WORKER}"
+        echo "✅ ${WORKER} deleted"
+      loop: "{{ removal_workers }}"
+      register: vm_deletion
+      when: action == "remove"
+
+    - name: Purge deleted VMs
+      ansible.builtin.shell: |
+        multipass purge
+        echo "✅ Purged deleted VMs"
+      register: purge_result
+      when: action == "remove"
+
+    - name: Display VM deletion results
+      ansible.builtin.debug:
+        msg: "✅ Deleted {{ removal_workers | length }} VM(s) from Multipass"
+      when: action == "remove"
+
+# ==============================================================================
+# PLAY 9: Scale DOWN - Update inventory
+# ==============================================================================
+- name: Update inventory after removal
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+    inventory_path: "{{ playbook_dir }}/../inventory.yml"
+
+  tasks:
+    - name: Read current inventory
+      ansible.builtin.slurp:
+        src: "{{ inventory_path }}"
+      register: inventory_content
+      when: action == "remove"
+
+    - name: Parse inventory YAML
+      ansible.builtin.set_fact:
+        inventory_data: "{{ inventory_content.content | b64decode | from_yaml }}"
+      when: action == "remove"
+
+    - name: Remove workers from inventory
+      ansible.builtin.set_fact:
+        updated_workers: >-
+          {{
+            inventory_data.all.children.workers.hosts |
+            dict2items |
+            rejectattr('key', 'in', removal_workers) |
+            items2dict
+          }}
+      when: action == "remove"
+
+    - name: Build updated inventory
+      ansible.builtin.set_fact:
+        updated_inventory: >-
+          {{
+            inventory_data | combine({
+              'all': {
+                'vars': inventory_data.all.vars,
+                'children': {
+                  'master': inventory_data.all.children.master,
+                  'workers': {
+                    'hosts': updated_workers
+                  }
+                }
+              }
+            }, recursive=True)
+          }}
+      when: action == "remove"
+
+    - name: Write updated inventory
+      ansible.builtin.copy:
+        content: "{{ updated_inventory | to_nice_yaml(indent=2) }}"
+        dest: "{{ inventory_path }}"
+        backup: yes
+      when: action == "remove"
+
+    - name: Display inventory update
+      ansible.builtin.debug:
+        msg: "✅ Removed {{ removal_workers | length }} worker(s) from inventory.yml"
+      when: action == "remove"
+
+    - name: Refresh Ansible inventory
+      ansible.builtin.meta: refresh_inventory
+      when: action == "remove"
+
+# ==============================================================================
+# PLAY 10: Final verification and summary
+# ==============================================================================
+- name: Final cluster verification
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    action: "{{ action | default('add') }}"
+
+  tasks:
+    - name: Get final cluster state
+      ansible.builtin.shell: |
+        multipass exec k3s-master -- sudo kubectl get nodes -o wide
+      register: final_cluster_state
+      changed_when: false
+
+    - name: Get worker count
+      ansible.builtin.shell: |
+        multipass list --format csv | grep k3s-worker | wc -l
+      register: final_worker_count
+      changed_when: false
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║         SCALE {{ action | upper }} COMPLETED SUCCESSFULLY           ║
+          ╚════════════════════════════════════════════════════════╝
+
+          Final worker count: {{ final_worker_count.stdout }}
+
+          Cluster status:
+          {{ final_cluster_state.stdout }}
+
+          {% if action == 'remove' %}
+          Removed workers:
+          {% for worker in removal_workers %}
+          - {{ worker }}
+          {% endfor %}
+          {% endif %}
+
+          Verification commands:
+          - Check nodes: multipass exec k3s-master -- sudo kubectl get nodes
+          - Check pods:  multipass exec k3s-master -- sudo kubectl get pods -A
+          - List VMs:    multipass list

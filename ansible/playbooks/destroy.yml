@@ -1,16 +1,87 @@
 ---
-- name: Destroy all Multipass VMs
+# Playbook: destroy.yml
+# Purpose: Destroy all k3s-related Multipass VMs
+# Usage: ansible-playbook playbooks/destroy.yml
+
+- name: Destroy all k3s Multipass VMs
   hosts: localhost
   connection: local
   gather_facts: no
 
-  vars:
-    nodes:
-      - k3s-master
-      - k3s-worker-1
-      - k3s-worker-2
-
   tasks:
-    - name: Delete instances
-      command: multipass delete --purge {{ item }}
-      loop: "{{ nodes }}"
+    - name: Get list of all k3s VMs
+      ansible.builtin.shell: |
+        multipass list --format csv | grep '^k3s-' | cut -d',' -f1
+      register: k3s_vms
+      changed_when: false
+      failed_when: false
+
+    - name: Display VMs to be destroyed
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║          DESTROYING K3S CLUSTER VMs                    ║
+          ╚════════════════════════════════════════════════════════╝
+
+          VMs to destroy:
+          {% if k3s_vms.stdout_lines | length > 0 %}
+          {% for vm in k3s_vms.stdout_lines %}
+          - {{ vm }}
+          {% endfor %}
+          {% else %}
+          (none - no k3s VMs found)
+          {% endif %}
+
+    - name: Stop all k3s VMs
+      ansible.builtin.shell: |
+        multipass stop {{ item }}
+      loop: "{{ k3s_vms.stdout_lines }}"
+      when: k3s_vms.stdout_lines | length > 0
+      register: stop_result
+      failed_when: false
+
+    - name: Delete all k3s VMs
+      ansible.builtin.shell: |
+        multipass delete {{ item }}
+      loop: "{{ k3s_vms.stdout_lines }}"
+      when: k3s_vms.stdout_lines | length > 0
+      register: delete_result
+      failed_when: false
+
+    - name: Purge deleted VMs
+      ansible.builtin.shell: |
+        multipass purge
+      when: k3s_vms.stdout_lines | length > 0
+
+    - name: Reset inventory to empty state
+      ansible.builtin.copy:
+        content: |
+          all:
+            children:
+              master:
+                hosts:
+              workers:
+                hosts:
+            vars:
+              ansible_python_interpreter: /usr/bin/python3
+              ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
+              ansible_user: ubuntu
+        dest: "{{ playbook_dir }}/../inventory.yml"
+        backup: yes
+      when: k3s_vms.stdout_lines | length > 0
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║          CLUSTER DESTRUCTION COMPLETE                  ║
+          ╚════════════════════════════════════════════════════════╝
+
+          {% if k3s_vms.stdout_lines | length > 0 %}
+          ✅ Destroyed {{ k3s_vms.stdout_lines | length }} VM(s)
+          ✅ Inventory reset to empty state
+          {% else %}
+          ℹ️  No k3s VMs were found
+          {% endif %}
+
+          Verify with: multipass list
