@@ -13,6 +13,16 @@
       pause:
         seconds: 60
 
+    - name: Refresh inventory to get updated IPs
+      meta: refresh_inventory
+
+- name: Prepare all nodes with common configuration
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - common
+
 - name: Setup K3s control plane
   import_playbook: control-plane.yml
 

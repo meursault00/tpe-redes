@@ -1,5 +1,66 @@
 ---
-- name: Ensure system is up-to-date
-  apt:
+# Role: common
+# Purpose: Configure common dependencies and settings for all k3s nodes
+
+- name: Update apt cache
+  ansible.builtin.apt:
     update_cache: yes
-    upgrade: dist
+    cache_valid_time: 3600
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - wget
+      - vim
+      - git
+      - htop
+      - net-tools
+      - apt-transport-https
+      - ca-certificates
+      - software-properties-common
+    state: present
+
+- name: Configure system timezone
+  community.general.timezone:
+    name: "{{ timezone | default('UTC') }}"
+  when: timezone is defined
+
+- name: Disable swap (required for Kubernetes)
+  ansible.builtin.command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+- name: Remove swap from /etc/fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '\sswap\s'
+    state: absent
+
+- name: Enable IPv4 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: yes
+    state: present
+    reload: yes
+
+- name: Enable IPv6 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: '1'
+    sysctl_set: yes
+    state: present
+    reload: yes
+  when: enable_ipv6 | default(false)
+
+- name: Load required kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - br_netfilter
+    - overlay
+
+- name: Display common setup completion
+  ansible.builtin.debug:
+    msg: "Common dependencies configured on {{ inventory_hostname }}"

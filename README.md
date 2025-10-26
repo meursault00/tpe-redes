@@ -181,11 +181,11 @@ Complete cleanup of all resources:
 
 - **Control Plane (Master)**: 1 node running k3s server
   - API Server, Scheduler, Controller Manager, etcd
-  - IP: 192.168.64.20
+  - IP: 192.168.64.23
 
 - **Worker Nodes**: 2+ nodes running k3s agents
   - kubelet, kube-proxy, containerd
-  - IPs: 192.168.64.21, 192.168.64.22
+  - IPs: 192.168.64.24, 192.168.64.25
 
 - **Network**:
   - Host: 192.168.64.0/24
@@ -245,7 +245,7 @@ ansible master -m shell -a "kubectl get nodes"
 ansible master -m shell -a "cat /var/lib/rancher/k3s/server/node-token"
 
 # Manually test connection from worker
-multipass exec k3s-worker-1 -- curl -k https://192.168.64.20:6443
+multipass exec k3s-worker-1 -- curl -k https://192.168.64.23:6443
 ```
 
 ## Development
