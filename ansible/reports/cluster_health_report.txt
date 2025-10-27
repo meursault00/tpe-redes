@@ -1,0 +1,8 @@
+Cluster Health Report
+=====================
+Nodes Ready: 3/3
+Pods Running: 7/9
+
+Unhealthy Nodes:
+
+Failed Pods:

@@ -1,0 +1,87 @@
+---
+# Playbook: health.yml
+# Purpose: Evaluate cluster health and report status summary
+
+- name: Evaluate cluster health
+  hosts: master
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check node readiness
+      ansible.builtin.command: kubectl get nodes --no-headers
+      register: nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Analyze node readiness
+      ansible.builtin.set_fact:
+        unhealthy_nodes: "{{ nodes.stdout_lines | select('search', 'NotReady') | list }}"
+        total_nodes: "{{ nodes.stdout_lines | length }}"
+        ready_nodes: "{{ nodes.stdout_lines | select('search', 'Ready') | list | length }}"
+
+    - name: Check pod health
+      ansible.builtin.command: kubectl get pods --all-namespaces --no-headers
+      register: pods
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    
+    # - name: Check health of The Store services
+    #   command: kubectl get pods -n the-store
+    #   register: store_pods
+
+    - name: Analyze pod states
+      ansible.builtin.set_fact:
+        failed_pods: "{{ pods.stdout_lines | reject('search', 'Running') | reject('search', 'Completed') | list }}"
+        total_pods: "{{ pods.stdout_lines | length }}"
+        healthy_pods: "{{ pods.stdout_lines | select('search', 'Running') | list | length }}"
+
+    - name: Display health summary
+      ansible.builtin.debug:
+        msg: |
+          🩺 Cluster Health Summary
+          ==========================
+          Nodes: {{ ready_nodes }}/{{ total_nodes }} Ready
+          Pods:  {{ healthy_pods }}/{{ total_pods }} Healthy
+
+          {% if unhealthy_nodes|length > 0 %}
+          ⚠️ Unhealthy nodes:
+          {% for n in unhealthy_nodes %}
+            - {{ n }}
+          {% endfor %}
+          {% endif %}
+
+          {% if failed_pods|length > 0 %}
+          ❌ Failed pods:
+          {% for p in failed_pods %}
+            - {{ p }}
+          {% endfor %}
+          {% endif %}
+
+    - name: Ensure reports directory exists
+      ansible.builtin.file:
+        path: "../reports"
+        state: directory
+      delegate_to: localhost
+      become: false
+
+    - name: Write report to file
+      ansible.builtin.copy:
+        dest: "../reports/cluster_health_report.txt"
+        content: |
+          Cluster Health Report
+          =====================
+          Nodes Ready: {{ ready_nodes }}/{{ total_nodes }}
+          Pods Running: {{ healthy_pods }}/{{ total_pods }}
+
+          Unhealthy Nodes:
+          {% for n in unhealthy_nodes %}
+          - {{ n }}
+          {% endfor %}
+
+          Failed Pods:
+          {% for p in failed_pods %}
+          - {{ p }}
+          {% endfor %}
+      delegate_to: localhost
+      become: false
