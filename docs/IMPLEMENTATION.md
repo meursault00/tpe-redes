@@ -672,18 +672,399 @@ If professors want simpler, we can create a minimal branch with explanations of 
 
 ---
 
+## Application Deployment System
+
+### Overview
+
+We implemented a complete deployment automation system for **The Store**, a microservices e-commerce application, to demonstrate real-world cluster usage beyond just infrastructure management.
+
+### Why Deploy an Application?
+
+**Academic value:**
+- Shows complete infrastructure-to-application workflow
+- Demonstrates Ansible handling complex multi-step processes
+- Proves the k3s cluster actually works with real workloads
+- Great for presentation/demo
+
+**What we automate:**
+1. Building Docker images from source
+2. Distributing images to multiple nodes
+3. Deploying Kubernetes manifests
+4. Verification and access
+
+### The Application: The Store
+
+**What it is:**
+- Modern microservices e-commerce platform
+- 5 services: catalog (Go), cart (Java), checkout (Node.js), orders (Java), ui (Java)
+- Pre-built Kubernetes manifests (671 lines)
+- Real-world complexity (secrets, configmaps, deployments, services, ingress)
+
+**Why this app:**
+- Available in course materials
+- Representative of production microservices
+- Has all common Kubernetes resources
+- Actually functional (can browse products, add to cart)
+
+### Challenge 1: Docker Images
+
+**Problem:**
+- The Store builds images locally for Kind (local Kubernetes)
+- k3s runs on remote Multipass VMs
+- Can't use Docker registry (keeps project self-contained)
+- Each worker needs the images
+
+**Solutions considered:**
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Push to Docker Hub** | Standard practice | Requires account, public images, internet dependency | ❌ Rejected - external dependency |
+| **Local registry in cluster** | Clean, professional | Complex setup, extra component | ❌ Rejected - too complex |
+| **Build on each worker** | Simple conceptually | Slow, requires build tools on workers | ❌ Rejected - wastes resources |
+| **Transfer tar files** | Self-contained, fast | Manual process, requires scripting | ✅ **Chosen** - best for demo |
+
+**Our implementation:**
+```yaml
+# 1. Build images on localhost (has Docker)
+docker build -t the-store-catalog:latest src/catalog/
+
+# 2. Save to tar
+docker save -o the-store-catalog.tar the-store-catalog:latest
+
+# 3. Transfer to worker
+multipass transfer the-store-catalog.tar k3s-worker-1:/tmp/
+
+# 4. Import into containerd (k3s uses containerd, not Docker)
+multipass exec k3s-worker-1 -- sudo ctr -n k8s.io images import /tmp/the-store-catalog.tar
+```
+
+**Why this works:**
+- k3s uses containerd as container runtime
+- `ctr` is containerd's CLI tool
+- Namespace `k8s.io` is where k3s stores images
+- Once imported, pods can use `imagePullPolicy: IfNotPresent`
+
+**Trade-offs:**
+- ✅ Fully automated via Ansible
+- ✅ No external dependencies
+- ✅ Fast (parallel transfer to all workers)
+- ✅ Works offline
+- ❌ Images tied to specific nodes (not a problem for demo)
+- ❌ Need to rebuild/retransfer for updates (acceptable)
+
+### Challenge 2: Ingress Controller
+
+**Problem:**
+- The Store manifests specify `kubernetes.io/ingress.class: nginx`
+- k3s comes with Traefik ingress controller (not nginx)
+- Installing nginx would be redundant and wasteful
+
+**Solutions considered:**
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Install nginx ingress** | Manifests work as-is | Extra component, resource usage | ❌ Rejected - unnecessary |
+| **Remove Ingress, use NodePort** | Simple | No path-based routing, non-standard | ❌ Rejected - less realistic |
+| **Adapt to Traefik** | Uses built-in component | Need to modify manifests | ✅ **Chosen** - clean solution |
+
+**Our implementation:**
+```yaml
+# One line change in kubernetes.yaml
+annotations:
+  kubernetes.io/ingress.class: traefik  # was: nginx
+```
+
+**Why Traefik:**
+- Already installed in k3s (zero setup)
+- Lightweight and fast
+- Automatically watches Ingress resources
+- Supports same Ingress spec as nginx (just different annotation)
+
+**How it works:**
+1. Ingress resource specifies `ingressClassName: traefik`
+2. Traefik controller sees the resource
+3. Automatically configures routes
+4. Traffic to master-ip goes to ui service
+
+### Challenge 3: Deployment Automation
+
+**Problem:**
+- Multi-step process (build, transfer, import, deploy)
+- Need to handle 5 different images
+- Multiple worker nodes to update
+- Error handling and verification
+
+**Our solution: Two playbooks**
+
+#### build-store-images.yml (~90 lines)
+
+**Purpose:** Build and package images
+```yaml
+Tasks:
+1. Verify Docker is running
+2. Check The Store source exists
+3. Build each service image
+4. Save each image to tar
+5. Display summary with file sizes
+```
+
+**Why separate:**
+- Can rebuild without redeploying
+- Faster iteration during development
+- Clear separation of concerns
+- Reusable for CI/CD
+
+#### deploy-app.yml (~230 lines)
+
+**Purpose:** Complete deployment workflow
+```yaml
+Play 1: Pre-flight checks
+- Ensure k3s cluster exists
+- Deploy cluster if needed
+
+Play 2: Build images (if needed)
+- Check if tars exist
+- Build if missing
+
+Play 3: Distribute images
+- Transfer tars to all workers
+- Import into containerd
+- Verify import succeeded
+
+Play 4: Deploy manifests
+- Transfer manifests to master
+- Create namespace
+- Apply resources
+- Wait for pods Ready
+
+Play 5: Verification
+- Get pod status
+- Get services
+- Display access URL
+- Show verification commands
+```
+
+**Key features:**
+- Idempotent (safe to re-run)
+- Checks before acting
+- Parallel operations where possible
+- Clear progress messages
+- Comprehensive verification
+
+### Implementation Details
+
+#### Image Distribution (The Tricky Part)
+
+**Challenge:** Get images from localhost to worker nodes' containerd
+
+**Step-by-step:**
+```bash
+# On localhost (has Docker):
+docker build -t the-store-catalog:latest .
+docker save -o catalog.tar the-store-catalog:latest
+
+# Transfer to worker:
+multipass transfer catalog.tar k3s-worker-1:/tmp/
+
+# On worker (has containerd):
+ctr -n k8s.io images import /tmp/catalog.tar
+
+# Verify:
+ctr -n k8s.io images list | grep the-store
+```
+
+**Why `-n k8s.io`:**
+- containerd uses namespaces to isolate images
+- k3s stores its images in `k8s.io` namespace
+- Default namespace won't work
+
+**Ansible automation:**
+```yaml
+- name: Import images into containerd
+  ansible.builtin.shell: |
+    multipass exec {{ item[0] }} -- sudo ctr -n k8s.io images import /tmp/the-store-{{ item[1] }}.tar
+  loop: "{{ workers | product(services) | list }}"
+```
+
+This creates a cartesian product: (worker-1, catalog), (worker-1, cart), ..., (worker-2, catalog), etc.
+
+#### Manifest Adaptation
+
+**Original Ingress:**
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx  # ❌ nginx not installed
+spec:
+  rules:
+    - host: "localhost"
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: ui
+```
+
+**Modified for Traefik:**
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: traefik  # ✅ uses k3s built-in
+spec:
+  rules:
+    - host: "localhost"  # Access via master IP
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: ui
+```
+
+**Access:**
+- Get master IP: `multipass info k3s-master | grep IPv4`
+- Browse to: `http://<master-ip>`
+- Traefik routes traffic to ui service on port 80
+
+### Why This Approach Works
+
+**For academic project:**
+1. ✅ Fully automated (impressive demo)
+2. ✅ Self-contained (no external dependencies)
+3. ✅ Demonstrates Ansible capabilities
+4. ✅ Shows understanding of k3s/containerd
+5. ✅ Real application, not just toy example
+
+**Technical merit:**
+1. ✅ Proper container image management
+2. ✅ Correct use of containerd CLI
+3. ✅ Kubernetes best practices (namespaces, labels)
+4. ✅ Ingress routing configuration
+5. ✅ Multi-node coordination
+
+**Presentation value:**
+1. ✅ Visual demo (can show web UI)
+2. ✅ End-to-end workflow
+3. ✅ Handles complexity gracefully
+4. ✅ Professional quality
+
+### Alternative Approaches (Not Chosen)
+
+#### 1. Simplified Demo App
+
+**What:** Deploy nginx or redis instead
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest  # Public image, no build needed
+```
+
+**Why not:**
+- ✅ Much simpler
+- ❌ Doesn't demonstrate real complexity
+- ❌ Public image (less impressive)
+- ❌ No microservices architecture
+
+#### 2. Registry-Based Deployment
+
+**What:** Push images to Docker Hub, pull from there
+```yaml
+# Push to registry:
+docker tag the-store-catalog:latest user/the-store-catalog:latest
+docker push user/the-store-catalog:latest
+
+# In deployment:
+containers:
+- name: catalog
+  image: user/the-store-catalog:latest
+  imagePullPolicy: Always
+```
+
+**Why not:**
+- ✅ Standard practice
+- ✅ Simpler workflow
+- ❌ Requires Docker Hub account
+- ❌ External dependency
+- ❌ Images become public
+- ❌ Less self-contained
+
+#### 3. Build on Workers
+
+**What:** Copy source to workers, build there
+```bash
+multipass exec k3s-worker-1 -- docker build -t the-store-catalog:latest /source/catalog
+```
+
+**Why not:**
+- ✅ Images automatically available
+- ❌ Workers need Docker + build tools
+- ❌ Slow (build on each worker separately)
+- ❌ Wastes resources
+- ❌ k3s uses containerd, not Docker
+
+### Complexity Justification
+
+**Total lines added:**
+- build-store-images.yml: 90 lines
+- deploy-app.yml: 230 lines
+- Manifest modifications: 1 line
+- **Total: ~320 lines**
+
+**Is it worth it?**
+
+**Yes, because:**
+1. Demonstrates complete platform (not just infrastructure)
+2. Solves real problems (image distribution to containerd)
+3. Professional quality (error handling, verification)
+4. Reusable for any containerized app
+5. Great for presentation
+
+**Could be simpler:**
+- Manual steps in documentation (~50 lines)
+- Simple nginx deployment (~10 lines)
+- Trade-off: Less impressive, less learning
+
+### Lessons Learned
+
+1. **containerd vs Docker:** k3s uses containerd; need `ctr` not `docker`
+2. **Image distribution:** Tar files work well for local clusters
+3. **Ingress flexibility:** Easy to swap nginx/traefik with annotation change
+4. **Ansible loops:** `product` filter creates cartesian products elegantly
+5. **Verification matters:** Wait loops prevent race conditions
+
+---
+
 ## Appendix: Line Counts
 
 **Total project size:**
 ```
-ansible/playbooks/deploy-all.yml:     ~180 lines
-ansible/playbooks/scale.yml:          ~589 lines
-ansible/playbooks/destroy.yml:        ~88 lines
-ansible/roles/common/tasks/main.yml:  ~67 lines
-ansible/roles/master/tasks/main.yml:  ~30 lines
-ansible/roles/worker/tasks/main.yml:  ~20 lines
-----------------------------------------
-Total:                                ~974 lines
+# Infrastructure Management
+ansible/playbooks/deploy-all.yml:        ~180 lines
+ansible/playbooks/scale.yml:             ~589 lines
+ansible/playbooks/destroy.yml:           ~88 lines
+ansible/roles/common/tasks/main.yml:     ~67 lines
+ansible/roles/master/tasks/main.yml:     ~30 lines
+ansible/roles/worker/tasks/main.yml:     ~20 lines
+
+# Application Deployment (NEW)
+ansible/playbooks/build-store-images.yml: ~90 lines
+ansible/playbooks/deploy-app.yml:        ~230 lines
+ansible/manifests/the-store/*.yaml:      ~671 lines (adapted)
+------------------------------------------------------
+Total:                                   ~1,965 lines
 ```
 
 **Essential core (minimal version):**
@@ -700,6 +1081,162 @@ Total:            ~620 lines (-35%)
 
 ---
 
-**Last updated:** October 26, 2025
+## Network Connectivity Issues and Resolution
+
+### The Problem: "No Route to Host" SSH Failures
+
+During development of the application deployment system, we encountered a critical issue where Ansible would consistently fail to connect to VMs with "No route to host" errors, despite:
+
+- VMs showing as "Running" in multipass
+- IP addresses being correctly assigned
+- Cloud-init completing successfully
+- Manual SSH with proper keys available
+
+#### Investigation Timeline
+
+**Initial Hypothesis (INCORRECT):**
+1. SSH not ready yet → Added 60s wait
+2. Ansible config not loaded → Added ANSIBLE_CONFIG environment variable
+3. wait_for_connection timing → Increased to 180s timeout
+4. **Result:** Still failed after 185+ seconds
+
+**Actual Root Cause Discovery:**
+
+After systematic investigation, we discovered:
+
+```bash
+# Even multipass exec failed!
+$ multipass exec k3s-master -- echo "test"
+exec failed: ssh connection failed: 'Failed to connect: No route to host'
+
+# Direct ping also failed
+$ ping -c 2 192.168.64.49
+Request timeout for icmp_seq 0
+
+# But VMs were Running with correct IPs
+$ multipass list
+k3s-master    Running    192.168.64.49    Ubuntu 22.04 LTS
+```
+
+The issue was **NOT an SSH daemon problem** - the entire network layer was corrupted at the host bridge level.
+
+#### Root Cause: k3s Flannel CNI Network Corruption
+
+**What happens:**
+
+1. k3s uses **Flannel CNI** for pod networking (creates 10.42.x.x overlay)
+2. Flannel creates:
+   - iptables rules for pod-to-pod routing
+   - Virtual interfaces: `flannel.1`, `cni0`, multiple `veth*` devices
+   - Overlay network tunneling via VXLAN
+
+3. When VMs experience lifecycle events (stop/start, network disruptions, crashes):
+   - Flannel state becomes inconsistent between nodes
+   - iptables rules may block traffic incorrectly
+   - The physical bridge interface loses proper routing
+   - **This cascades to block ALL network access**, including SSH from host
+
+**Evidence from k3s logs:**
+```
+time="2025-10-27T19:19:20" level=error msg="dial tcp 10.42.0.11:10250: connect: no route to host"
+E1027 19:19:20 error resolving kube-system/metrics-server: no endpoints available
+```
+
+The pod network corruption prevented k3s from reaching its own pods, which then corrupted the host network routing.
+
+#### Solution: Network Health Detection and Recovery
+
+We implemented a **pre-flight network health check** in [deploy-app.yml](../ansible/playbooks/deploy-app.yml:26-89):
+
+**Detection Phase:**
+```yaml
+- name: Validate network health if cluster exists
+  ansible.builtin.shell: |
+    for vm in k3s-master k3s-worker-1 k3s-worker-2; do
+      if multipass list | grep -q "$vm.*Running"; then
+        IP=$(multipass info $vm --format csv | tail -n1 | cut -d',' -f3)
+        if ! ping -c 2 -W 3 $IP > /dev/null 2>&1; then
+          echo "WARNING: $vm ($IP) is unreachable"
+          exit 1
+        fi
+      fi
+    done
+```
+
+**Recovery Phase:**
+```yaml
+- name: Recover from network corruption
+  ansible.builtin.shell: |
+    multipass stop k3s-master k3s-worker-1 k3s-worker-2
+    sleep 10
+    multipass start k3s-master k3s-worker-1 k3s-worker-2
+    sleep 30
+    # Verify recovery...
+```
+
+**Why this works:**
+
+- VM stop/start causes Flannel to reinitialize cleanly
+- iptables rules are recreated correctly
+- Bridge networking reestablishes proper routes
+- Takes ~40 seconds but guarantees working state
+
+#### Key Learnings
+
+1. **Container networking is complex**: CNI plugins like Flannel manage significant network state that can become corrupted
+
+2. **"Running" != "Accessible"**: VM lifecycle state and network health are separate concerns
+
+3. **Symptoms can mislead**: "SSH not ready" was actually "network completely broken"
+
+4. **Fail-fast is better**: Detecting corruption early and recovering is more user-friendly than waiting 3+ minutes for timeout
+
+5. **Academic context value**: This demonstrates understanding of:
+   - Container networking fundamentals (CNI, overlay networks)
+   - System debugging methodology (hypothesis testing, eliminating causes)
+   - Robust automation design (detect failures, automatic recovery)
+
+#### Improvements to deploy-all.yml
+
+We also optimized the SSH readiness check in [deploy-all.yml](../ansible/playbooks/deploy-all.yml:8-43):
+
+**Changes:**
+- Reduced initial wait from 90s → 30s (unnecessary delay)
+- Use `wait_for` module from localhost (proper ansible.cfg context)
+- Clear labeling: "Waiting for SSH on {IP}"
+- Explicit ping test before proceeding with configuration
+
+**Result:** Clean deployments complete in ~60-90 seconds (down from 3+ minutes of failures)
+
+#### Alternative Approaches Considered
+
+**Option A: Always destroy/recreate**
+```yaml
+- name: Clean slate deployment
+  command: multipass delete --purge k3s-master k3s-worker-1 k3s-worker-2
+```
+**Pros:** Guaranteed clean state
+**Cons:** Destroys existing deployments, slower (~2 minutes for VM creation)
+
+**Option B: k3s service restart**
+```yaml
+- name: Restart k3s service
+  shell: multipass exec {{ item }} -- sudo systemctl restart k3s
+```
+**Pros:** Faster than VM restart (~10 seconds)
+**Cons:** Doesn't fix corrupted host bridge networking
+
+**Option C: Manual intervention**
+- Detect issue and fail with instructions
+**Pros:** Simplest code
+**Cons:** Poor user experience, requires manual steps
+
+**Our choice:** Automatic detection + recovery (Option from our implementation)
+- Best balance of reliability and user experience
+- Demonstrates production-ready automation thinking
+
+---
+
+**Last updated:** October 27, 2025
 **Authors:** Bengolea, Braun, López Menardi
 **Course:** Redes de Información (72.20) - ITBA

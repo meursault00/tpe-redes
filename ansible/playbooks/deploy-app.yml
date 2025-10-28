@@ -1,0 +1,428 @@
+---
+# Playbook: deploy-app.yml
+# Purpose: Deploy The Store e-commerce application to k3s cluster
+# Usage: ansible-playbook playbooks/deploy-app.yml
+
+# ==============================================================================
+# PLAY 1: Pre-flight checks and cluster readiness
+# ==============================================================================
+- name: Pre-flight checks and network health validation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    store_path: "{{ playbook_dir }}/../../the-store-main"
+    images_dir: "{{ playbook_dir }}/../images"
+    manifests_dir: "{{ playbook_dir }}/../manifests/the-store"
+
+  tasks:
+    - name: Check if k3s cluster is running
+      ansible.builtin.shell: |
+        # Check if VMs exist and are running
+        if ! multipass list --format csv | grep k3s-master | grep -q Running; then
+          exit 1
+        fi
+
+        # Get master IP
+        MASTER_IP=$(multipass info k3s-master --format csv | tail -n1 | cut -d',' -f3)
+
+        # Check if k3s is actually installed and working
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 \
+            ubuntu@${MASTER_IP} \
+            "sudo kubectl get nodes" > /dev/null 2>&1
+      register: cluster_check
+      changed_when: false
+      failed_when: false
+
+    - name: Validate network health if cluster exists
+      ansible.builtin.shell: |
+        set -e
+        UNHEALTHY=""
+        for vm in k3s-master k3s-worker-1 k3s-worker-2; do
+          if multipass list --format csv | grep -q "$vm.*Running"; then
+            echo "Checking connectivity to $vm..."
+            IP=$(multipass info $vm --format csv | tail -n1 | cut -d',' -f3)
+            if ! ping -c 2 -W 3 $IP > /dev/null 2>&1; then
+              echo "WARNING: $vm ($IP) is unreachable"
+              UNHEALTHY="true"
+            else
+              echo "OK: $vm ($IP) is reachable"
+            fi
+          fi
+        done
+        if [ -n "$UNHEALTHY" ]; then
+          echo "NETWORK_CORRUPTED"
+          exit 1
+        fi
+        echo "NETWORK_HEALTHY"
+        exit 0
+      register: network_health
+      changed_when: false
+      failed_when: false
+      when: cluster_check.rc == 0
+
+    - name: Display network health status
+      ansible.builtin.debug:
+        msg: |
+          Network health check: {{ 'CORRUPTED - VMs unreachable despite Running state' if network_health.rc == 1 else 'HEALTHY - All VMs reachable' if network_health.rc == 0 else 'SKIPPED - Cluster not running' }}
+
+          {% if network_health.rc == 1 %}
+          This is a known issue with k3s Flannel CNI after VM lifecycle events.
+          The VMs will be restarted to recover network connectivity.
+          {% endif %}
+      when: cluster_check.rc == 0
+
+    - name: Recover from network corruption
+      ansible.builtin.shell: |
+        echo "Restarting VMs to recover from Flannel CNI network corruption..."
+        multipass stop k3s-master k3s-worker-1 k3s-worker-2
+        sleep 10
+        multipass start k3s-master k3s-worker-1 k3s-worker-2
+        sleep 30
+
+        # Verify recovery
+        for vm in k3s-master k3s-worker-1 k3s-worker-2; do
+          IP=$(multipass info $vm --format csv | tail -n1 | cut -d',' -f3)
+          if ping -c 2 -W 3 $IP > /dev/null 2>&1; then
+            echo "Recovered: $vm ($IP) is now reachable"
+          else
+            echo "ERROR: $vm ($IP) still unreachable after restart"
+            exit 1
+          fi
+        done
+        echo "Network recovery successful"
+      register: recovery_result
+      when: cluster_check.rc == 0 and network_health.rc == 1
+
+    - name: Display recovery result
+      ansible.builtin.debug:
+        msg: "{{ recovery_result.stdout_lines }}"
+      when: cluster_check.rc == 0 and network_health.rc == 1
+
+    - name: Deploy k3s cluster if not running
+      ansible.builtin.command:
+        cmd: ansible-playbook deploy-all.yml
+        chdir: "{{ playbook_dir }}"
+      when: cluster_check.rc != 0
+      environment:
+        ANSIBLE_CONFIG: "{{ playbook_dir }}/../ansible.cfg"
+
+    - name: Wait for cluster to be ready
+      ansible.builtin.pause:
+        seconds: 30
+      when: cluster_check.rc != 0
+
+# ==============================================================================
+# PLAY 2: Build Docker images (if not already built)
+# ==============================================================================
+- name: Build application images
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    images_dir: "{{ playbook_dir }}/../images"
+    services:
+      - catalog
+      - cart
+      - checkout
+      - orders
+      - ui
+
+  tasks:
+    - name: Check if images already exist
+      ansible.builtin.stat:
+        path: "{{ images_dir }}/the-store-{{ item }}.tar"
+      loop: "{{ services }}"
+      register: image_files
+
+    - name: Count existing images
+      ansible.builtin.set_fact:
+        existing_images: "{{ image_files.results | selectattr('stat.exists') | list | length }}"
+
+    - name: Display image build status
+      ansible.builtin.debug:
+        msg: |
+          Found {{ existing_images }}/{{ services | length }} pre-built images
+          {% if existing_images | int == services | length %}
+          All images exist - skipping build
+          {% else %}
+          Building missing images...
+          {% endif %}
+
+    - name: Build images if needed
+      ansible.builtin.command:
+        cmd: ansible-playbook playbooks/build-store-images.yml
+        chdir: "{{ playbook_dir }}/.."
+      when: existing_images | int < services | length
+      environment:
+        ANSIBLE_CONFIG: "{{ playbook_dir }}/../ansible.cfg"
+
+# ==============================================================================
+# PLAY 3: Distribute images to k3s nodes (including master)
+# ==============================================================================
+- name: Transfer images to k3s nodes
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    images_dir: "{{ playbook_dir }}/../images"
+    services:
+      - catalog
+      - cart
+      - checkout
+      - orders
+      - ui
+
+  tasks:
+    - name: Get list of all k3s nodes (master + workers)
+      ansible.builtin.shell: |
+        multipass list --format csv | grep k3s | cut -d',' -f1
+      register: nodes
+      changed_when: false
+
+    - name: Display transfer plan
+      ansible.builtin.debug:
+        msg: |
+          Transferring {{ services | length }} images to {{ nodes.stdout_lines | length }} k3s nodes
+          Nodes: {{ nodes.stdout_lines | join(', ') }}
+
+          Note: Images are distributed to ALL nodes including master because
+          Kubernetes may schedule pods on any available node.
+
+    - name: Transfer image tar files to all nodes
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          NODE="{{ item[0] }}"
+          IMAGE="{{ item[1] }}"
+          TAR_FILE="{{ images_dir }}/the-store-${IMAGE}.tar"
+
+          echo "Transferring the-store-${IMAGE}.tar to ${NODE}..."
+
+          # Get node IP address
+          NODE_IP=$(multipass info "${NODE}" --format csv | tail -n1 | cut -d',' -f3)
+
+          # Use scp with our SSH key instead of multipass transfer
+          # (multipass transfer relies on multipass's internal SSH which can be unreliable)
+          scp -i ~/.ssh/multipass_id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              "${TAR_FILE}" \
+              "ubuntu@${NODE_IP}:/tmp/the-store-${IMAGE}.tar"
+
+          echo "Successfully transferred to ${NODE} (${NODE_IP})"
+      loop: "{{ nodes.stdout_lines | product(services) | list }}"
+      register: transfer_results
+
+    - name: Import images into containerd on all nodes
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          NODE="{{ item[0] }}"
+          IMAGE="{{ item[1] }}"
+
+          echo "Importing the-store-${IMAGE} on ${NODE}..."
+
+          # Get node IP address
+          NODE_IP=$(multipass info "${NODE}" --format csv | tail -n1 | cut -d',' -f3)
+
+          # Use direct SSH instead of multipass exec
+          # (multipass exec relies on multipass's internal SSH which can be unreliable)
+          ssh -i ~/.ssh/multipass_id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              "ubuntu@${NODE_IP}" \
+              "sudo ctr -n k8s.io images import /tmp/the-store-${IMAGE}.tar && sudo rm /tmp/the-store-${IMAGE}.tar"
+
+          echo "Successfully imported on ${NODE} (${NODE_IP})"
+      loop: "{{ nodes.stdout_lines | product(services) | list }}"
+      register: import_results
+
+    - name: Verify images on all nodes
+      ansible.builtin.shell:
+        cmd: |
+          NODE="{{ item }}"
+          NODE_IP=$(multipass info "${NODE}" --format csv | tail -n1 | cut -d',' -f3)
+
+          # Use direct SSH instead of multipass exec
+          ssh -i ~/.ssh/multipass_id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              "ubuntu@${NODE_IP}" \
+              "sudo ctr -n k8s.io images list | grep the-store | wc -l"
+      loop: "{{ nodes.stdout_lines }}"
+      register: verify_images
+      changed_when: false
+
+    - name: Display import summary
+      ansible.builtin.debug:
+        msg: |
+          Images successfully imported to all nodes!
+          {% for result in verify_images.results %}
+          {{ result.item }}: {{ result.stdout }} images
+          {% endfor %}
+
+# ==============================================================================
+# PLAY 4: Deploy manifests to k3s cluster
+# ==============================================================================
+- name: Deploy The Store application
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    manifests_dir: "{{ playbook_dir }}/../manifests/the-store"
+    namespace: "retail-store"
+
+  tasks:
+    - name: Get master node IP
+      ansible.builtin.shell: |
+        multipass info k3s-master --format csv | tail -n1 | cut -d',' -f3
+      register: master_ip
+      changed_when: false
+
+    - name: Transfer manifests to master node
+      ansible.builtin.shell: |
+        scp -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "{{ manifests_dir }}/kubernetes.yaml" \
+            "ubuntu@{{ master_ip.stdout }}:/tmp/the-store.yaml"
+
+    - name: Create namespace
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl create namespace {{ namespace }}" || true
+      register: create_ns
+      changed_when: "'created' in create_ns.stdout"
+
+    - name: Deploy The Store manifests
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl apply -f /tmp/the-store.yaml -n {{ namespace }}"
+      register: deploy_result
+
+    - name: Display deployment result
+      ansible.builtin.debug:
+        var: deploy_result.stdout_lines
+
+    - name: Wait for deployments to be ready
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl wait --for=condition=available --timeout=300s deployment --all -n {{ namespace }}"
+      register: wait_result
+      failed_when: false
+
+    - name: Get pod status
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl get pods -n {{ namespace }}"
+      register: pod_status
+      changed_when: false
+
+    - name: Display pod status
+      ansible.builtin.debug:
+        msg: |
+          Pod Status:
+          {{ pod_status.stdout }}
+
+# ==============================================================================
+# PLAY 5: Verification and access information
+# ==============================================================================
+- name: Verify deployment and display access info
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    namespace: "retail-store"
+
+  tasks:
+    - name: Get master node IP
+      ansible.builtin.shell: |
+        multipass info k3s-master --format csv | tail -n1 | cut -d',' -f3
+      register: master_ip
+      changed_when: false
+
+    - name: Get all services
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl get svc -n {{ namespace }}"
+      register: services
+      changed_when: false
+
+    - name: Get ingress details
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl get ingress -n {{ namespace }}"
+      register: ingress
+      changed_when: false
+
+    - name: Check if all pods are running
+      ansible.builtin.shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl get pods -n {{ namespace }} -o jsonpath='{.items[*].status.phase}' | grep -v Running || echo 'All Running'"
+      register: pod_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║      THE STORE DEPLOYMENT COMPLETED SUCCESSFULLY       ║
+          ╚════════════════════════════════════════════════════════╝
+
+          Access The Store application:
+          http://{{ master_ip.stdout }}
+
+          Services deployed:
+          {{ services.stdout }}
+
+          Ingress configuration:
+          {{ ingress.stdout }}
+
+          {% if 'All Running' in pod_check.stdout %}
+          All pods are Running!
+          {% else %}
+          Warning: Some pods may not be Ready yet. Check with:
+            ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl get pods -n {{ namespace }}
+          {% endif %}
+
+          Verification commands (using direct SSH):
+          - Check pods:     ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl get pods -n {{ namespace }}
+          - Check services: ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl get svc -n {{ namespace }}
+          - View logs:      ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl logs -n {{ namespace }} POD_NAME
+          - Describe pod:   ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl describe pod -n {{ namespace }} POD_NAME
+
+          Access from your browser:
+          http://{{ master_ip.stdout }}
+
+          (No /etc/hosts modification needed - ingress accepts any hostname)
+
+          Enjoy shopping at The Store!

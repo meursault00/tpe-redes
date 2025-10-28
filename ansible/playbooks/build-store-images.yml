@@ -1,0 +1,102 @@
+---
+# Playbook: build-store-images.yml
+# Purpose: Build Docker images for The Store microservices
+# Usage: ansible-playbook playbooks/build-store-images.yml
+
+- name: Build The Store microservice images
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    store_path: "{{ playbook_dir }}/../../the-store-main"
+    services:
+      - catalog
+      - cart
+      - checkout
+      - orders
+      - ui
+    image_tag: "latest"
+    images_dir: "{{ playbook_dir }}/../images"
+
+  tasks:
+    - name: Check if The Store source exists
+      ansible.builtin.stat:
+        path: "{{ store_path }}"
+      register: store_dir
+
+    - name: Fail if The Store source not found
+      ansible.builtin.fail:
+        msg: "The Store source directory not found at {{ store_path }}"
+      when: not store_dir.stat.exists
+
+    - name: Check Docker is running
+      ansible.builtin.command: docker info
+      register: docker_check
+      changed_when: false
+      failed_when: docker_check.rc != 0
+      ignore_errors: yes
+
+    - name: Fail if Docker is not running
+      ansible.builtin.fail:
+        msg: "Docker is not running. Please start Docker Desktop and try again."
+      when: docker_check.rc != 0
+
+    - name: Display build information
+      ansible.builtin.debug:
+        msg: |
+          Building The Store microservices...
+          Source: {{ store_path }}
+          Services: {{ services | join(', ') }}
+          Image tag: {{ image_tag }}
+
+    - name: Create images directory
+      ansible.builtin.file:
+        path: "{{ images_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Build Docker images
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          echo "Building {{ item }} service..."
+          cd "{{ store_path }}/src/{{ item }}"
+          docker build -t the-store-{{ item }}:{{ image_tag }} .
+          echo "Successfully built the-store-{{ item }}:{{ image_tag }}"
+      loop: "{{ services }}"
+      register: build_results
+
+    - name: Save Docker images to tar files
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          echo "Saving the-store-{{ item }}:{{ image_tag }} to tar..."
+          docker save -o "{{ images_dir }}/the-store-{{ item }}.tar" the-store-{{ item }}:{{ image_tag }}
+          echo "Saved to {{ images_dir }}/the-store-{{ item }}.tar"
+      loop: "{{ services }}"
+      register: save_results
+
+    - name: Get tar file sizes
+      ansible.builtin.stat:
+        path: "{{ images_dir }}/the-store-{{ item }}.tar"
+      loop: "{{ services }}"
+      register: tar_stats
+
+    - name: Display build summary
+      ansible.builtin.debug:
+        msg: |
+          Build completed successfully!
+
+          Images built:
+          {% for service in services %}
+          - the-store-{{ service }}:{{ image_tag }}
+          {% endfor %}
+
+          Tar files created in {{ images_dir }}/:
+          {% for stat in tar_stats.results %}
+          - {{ stat.stat.path | basename }} ({{ (stat.stat.size / 1024 / 1024) | round(1) }} MB)
+          {% endfor %}
+
+          Total size: {{ (tar_stats.results | map(attribute='stat.size') | sum / 1024 / 1024) | round(1) }} MB
+
+          Next step: Run deploy-app.yml to deploy these images to k3s

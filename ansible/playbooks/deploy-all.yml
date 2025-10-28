@@ -5,16 +5,123 @@
 - name: Provision Multipass VMs and update inventory
   import_playbook: provision.yml
 
-- name: Wait for VMs to be ready
+- name: Detect and recover from macOS vmnet initialization failure
   hosts: localhost
   gather_facts: no
   tasks:
-    - name: Wait for VMs to fully initialize
+    - name: Wait for initial VM boot
       pause:
-        seconds: 60
+        seconds: 20
 
-    - name: Refresh inventory to get updated IPs
+    - name: Refresh inventory to get VM IPs
       meta: refresh_inventory
+
+    - name: Get all VM IPs from inventory
+      set_fact:
+        vm_hosts: "{{ groups['all'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+    - name: Test network connectivity to detect vmnet initialization failure
+      shell: |
+        FAILED=""
+        for ip in {{ vm_hosts | join(' ') }}; do
+          echo "Testing connectivity to $ip..."
+          if ! ping -c 2 -W 3 "$ip" > /dev/null 2>&1; then
+            echo "FAILED: $ip unreachable"
+            FAILED="true"
+          else
+            echo "OK: $ip reachable"
+          fi
+        done
+        if [ -n "$FAILED" ]; then
+          echo "VMNET_INIT_FAILED"
+          exit 1
+        fi
+        echo "VMNET_INIT_SUCCESS"
+        exit 0
+      register: vmnet_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display network initialization status
+      debug:
+        msg: |
+          {% if vmnet_check.rc == 1 %}
+          ⚠️  macOS vmnet-shared networking failed to initialize properly
+
+          This is a known race condition with Multipass/QEMU vmnet framework on macOS.
+          The VMs are Running but the virtual network bridge is not functional.
+
+          Recovery: Restarting VMs to force vmnet re-initialization...
+          {% else %}
+          ✅ Network initialization successful - all VMs reachable
+          {% endif %}
+
+    - name: Recover from vmnet failure by restarting VMs
+      shell: |
+        echo "Stopping all VMs to reset vmnet state..."
+        multipass stop k3s-master k3s-worker-1 k3s-worker-2
+        sleep 10
+
+        echo "Starting VMs with fresh vmnet initialization..."
+        multipass start k3s-master k3s-worker-1 k3s-worker-2
+        sleep 30
+
+        echo "Verifying network recovery..."
+        FAILED=""
+        for ip in {{ vm_hosts | join(' ') }}; do
+          if ! ping -c 2 -W 3 "$ip" > /dev/null 2>&1; then
+            echo "ERROR: $ip still unreachable after restart"
+            FAILED="true"
+          else
+            echo "✓ $ip is now reachable"
+          fi
+        done
+
+        if [ -n "$FAILED" ]; then
+          echo "Network recovery failed - vmnet may require system reboot or multipassd restart"
+          exit 1
+        fi
+        echo "Network recovery successful"
+      when: vmnet_check.rc == 1
+      register: vmnet_recovery
+
+    - name: Display recovery result
+      debug:
+        msg: "{{ vmnet_recovery.stdout_lines }}"
+      when: vmnet_check.rc == 1
+
+- name: Wait for SSH readiness
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Refresh inventory after potential VM restart
+      meta: refresh_inventory
+
+    - name: Get VM IPs
+      set_fact:
+        vm_hosts: "{{ groups['all'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+    - name: Display target IPs
+      debug:
+        msg: "Waiting for SSH readiness on: {{ vm_hosts | join(', ') }}"
+
+    - name: Wait for SSH port to be open on all nodes
+      wait_for:
+        host: "{{ item }}"
+        port: 22
+        delay: 5
+        timeout: 120
+        state: started
+      loop: "{{ vm_hosts }}"
+      loop_control:
+        label: "Waiting for SSH on {{ item }}"
+
+- name: Test SSH connectivity
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Test Ansible SSH connection
+      ansible.builtin.ping:
 
 - name: Prepare all nodes with common configuration
   hosts: all
@@ -33,23 +140,36 @@
   hosts: localhost
   gather_facts: no
   tasks:
+    - name: Get master node IP
+      shell: multipass info k3s-master --format csv | tail -n1 | cut -d',' -f3
+      register: master_ip
+      changed_when: false
+
     - name: Get cluster status
-      command: multipass exec k3s-master -- sudo kubectl get nodes
+      shell: |
+        ssh -i ~/.ssh/multipass_id_rsa \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            ubuntu@{{ master_ip.stdout }} \
+            "sudo kubectl get nodes"
       register: cluster_status
       changed_when: false
-    
+
     - name: Display cluster status
       debug:
         msg: "{{ cluster_status.stdout_lines }}"
-    
+
     - name: Deployment complete
       debug:
         msg: |
           ✅ K3s cluster deployment complete!
-          
-          Access your cluster:
-            multipass exec k3s-master -- sudo kubectl get nodes
-            multipass exec k3s-master -- sudo kubectl get pods -A
-          
-          SSH into nodes:
+
+          Master node IP: {{ master_ip.stdout }}
+
+          Access your cluster using direct SSH:
+            ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl get nodes
+            ssh -i ~/.ssh/multipass_id_rsa ubuntu@{{ master_ip.stdout }} sudo kubectl get pods -A
+
+          Or access cluster from any node:
             ssh -i ~/.ssh/multipass_id_rsa ubuntu@<node-ip>

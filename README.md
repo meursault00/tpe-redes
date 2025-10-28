@@ -266,6 +266,101 @@ Joins worker nodes to the cluster:
 - Configures connection to master node
 - Verifies successful join
 
+## Deploying Applications
+
+### The Store - E-commerce Demo Application
+
+The project includes deployment automation for **The Store**, a microservices-based e-commerce platform with 5 services (catalog, cart, checkout, orders, UI).
+
+#### Quick Deploy
+
+Deploy The Store application to your k3s cluster:
+
+```bash
+cd ansible
+ansible-playbook playbooks/deploy-app.yml
+```
+
+This will:
+1. Ensure k3s cluster is running (deploys if needed)
+2. Build Docker images for all 5 microservices
+3. Distribute images to all worker nodes
+4. Deploy application manifests to k3s
+5. Wait for all pods to be Ready
+6. Display access URL
+
+**Access the application:**
+```
+http://<master-node-ip>
+```
+
+The playbook output will show the exact IP address.
+
+#### Architecture
+
+The Store consists of 5 microservices:
+
+| Service | Language | Purpose |
+|---------|----------|---------|
+| **catalog** | Go | Product catalog with search |
+| **cart** | Java (Spring Boot) | Shopping cart management |
+| **orders** | Java (Spring Boot) | Order processing |
+| **checkout** | Node.js (NestJS) | Checkout orchestration |
+| **ui** | Java (Spring Boot) | Web frontend |
+
+All services are deployed in the `retail-store` namespace with:
+- ClusterIP services for inter-service communication
+- Traefik Ingress routing external traffic to UI
+- Secrets and ConfigMaps for configuration
+
+#### Manual Build (Optional)
+
+To rebuild images without deploying:
+
+```bash
+cd ansible
+ansible-playbook playbooks/build-store-images.yml
+```
+
+Built images are saved in `ansible/images/` as tar files.
+
+#### Verification
+
+```bash
+# Check all pods
+multipass exec k3s-master -- sudo kubectl get pods -n retail-store
+
+# Check services
+multipass exec k3s-master -- sudo kubectl get svc -n retail-store
+
+# Check ingress
+multipass exec k3s-master -- sudo kubectl get ingress -n retail-store
+
+# View logs
+multipass exec k3s-master -- sudo kubectl logs -n retail-store <pod-name>
+```
+
+#### Troubleshooting
+
+**Pods not starting:**
+```bash
+# Check pod details
+multipass exec k3s-master -- sudo kubectl describe pod -n retail-store <pod-name>
+
+# Check events
+multipass exec k3s-master -- sudo kubectl get events -n retail-store --sort-by='.lastTimestamp'
+```
+
+**Can't access via browser:**
+- Verify Ingress is configured: `kubectl get ingress -n retail-store`
+- Add to `/etc/hosts`: `<master-ip> localhost`
+- Check Traefik is running: `kubectl get pods -n kube-system | grep traefik`
+
+**Images not loading:**
+- Verify images on workers: `multipass exec k3s-worker-1 -- sudo ctr -n k8s.io images list | grep the-store`
+- Rebuild images: `ansible-playbook playbooks/build-store-images.yml`
+- Check imagePullPolicy in manifests (should be `IfNotPresent`)
+
 ## Architecture
 
 ### Network Topology

@@ -1,10 +1,17 @@
 all:
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
+
   children:
     master:
       hosts:
+        k3s-master:
+          ansible_host: 192.168.64.64
     workers:
       hosts:
-  vars:
-    ansible_python_interpreter: /usr/bin/python3
-    ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
-    ansible_user: ubuntu
+        k3s-worker-1:
+          ansible_host: 192.168.64.65
+        k3s-worker-2:
+          ansible_host: 192.168.64.66

@@ -67,3 +67,5 @@ docs/_build/
 site/
 
 ansible/playbooks/join-token.txt
+
+the-store-main
