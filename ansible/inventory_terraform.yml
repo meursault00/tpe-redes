@@ -1,0 +1,16 @@
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/terraform_key.pem
+  
+  children:
+    master:
+      hosts:
+        ec2-master:
+          ansible_host: 3.88.45.101   # IP from Terraform output
+    workers:
+      hosts:
+        ec2-worker-1:
+          ansible_host: 3.92.176.42
+        ec2-worker-2:
+          ansible_host: 44.200.67.89

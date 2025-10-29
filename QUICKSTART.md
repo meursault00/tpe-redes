@@ -108,3 +108,24 @@ git commit -m "feat: initial k3s cluster management structure
 git remote add origin <your-repo-url>
 git push -u origin main
 ```
+
+## Terraform Deployment (AWS EC2)
+
+For cloud deployment using Terraform-provisioned EC2 instances:
+
+```bash
+# 1. Ensure EC2 instances are running and you have IPs + SSH key (.pem)
+
+# 2. Create inventory_terraform.yml in repo root (see docs/GETTING_STARTED.md for example)
+
+# 3. Provision (skip VM creation)
+ansible-playbook ansible/playbooks/provision.yml -e deployment_mode=terraform
+
+# 4. Install k3s cluster
+ansible-playbook ansible/playbooks/install.yml
+
+# 5. Check status
+ansible-playbook ansible/playbooks/status.yml
+```
+
+**Note**: Requires `inventory_terraform.yml` with EC2 IPs and SSH key path.

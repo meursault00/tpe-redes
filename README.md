@@ -14,7 +14,7 @@ Automated Kubernetes cluster deployment and management using Ansible and k3s.
 
 ## Overview
 
-This project provides a complete automation solution for deploying and managing Kubernetes clusters using Ansible and k3s. It supports local development using Multipass VMs on macOS with Apple Silicon.
+This project provides a complete automation solution for deploying and managing Kubernetes clusters using Ansible and k3s. It supports both local development using Multipass VMs on macOS with Apple Silicon and cloud deployment to AWS EC2 instances provisioned by Terraform.
 
 ### Features
 
@@ -25,6 +25,7 @@ This project provides a complete automation solution for deploying and managing 
 - **Health monitoring**: Built-in verification that nodes join successfully
 - **Complete cluster teardown**: Clean destruction of all resources
 - **Idempotent playbooks**: Safe to run multiple times without side effects
+- **Multi-environment support**: Deploy to local Multipass VMs or AWS EC2 instances via Terraform integration
 
 ## Quick Start
 
