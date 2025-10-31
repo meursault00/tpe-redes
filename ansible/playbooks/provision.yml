@@ -1,129 +1,110 @@
 ---
-- name: Provision Multipass VMs
+- name: Provision Multipass VMs (skippable in terraform mode)
   hosts: localhost
   connection: local
   gather_facts: no
 
   vars:
+    # Use deployment_mode variable directly from command line or default to multipass
     nodes:
       - name: k3s-master
       - name: k3s-worker-1
       - name: k3s-worker-2
 
   tasks:
-    - name: Launch Multipass instances with cloud-init
-      command: >
-        multipass launch 22.04
-        --name {{ item.name }}
-        ---
+    - name: Check whether we're in terraform deployment mode
+      debug:
+        msg: "Deployment mode: {{ deployment_mode | default('multipass') }}"
 
-        - name: Provision Multipass VMs (skippable in terraform mode)
-          hosts: localhost
-          connection: local
-          gather_facts: no
+    - name: Terraform mode - skip Multipass provisioning and use provided inventory if available
+      block:
+        - name: Check for repository inventory_terraform.yml
+          ansible.builtin.stat:
+            path: "{{ playbook_dir }}/../inventory_terraform.yml"
+          register: tf_inventory_stat
 
-          vars:
-            # default to multipass mode unless explicitly overridden (e.g. -e deployment_mode=terraform
-            deployment_mode: "{{ deployment_mode | default('multipass') }}"
-            nodes:
-              - name: k3s-master
-              - name: k3s-worker-1
-              - name: k3s-worker-2
+        - name: Copy terraform inventory to inventory.yml
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../inventory_terraform.yml"
+            dest: "{{ playbook_dir }}/../inventory.yml"
+            remote_src: yes
+          when: tf_inventory_stat.stat.exists
 
-          tasks:
-            - name: Check whether we're in terraform deployment mode
-              debug:
-                msg: "Deployment mode: {{ deployment_mode }}"
+        - name: Warn that terraform inventory was not found
+          ansible.builtin.debug:
+            msg: |
+              deployment_mode=terraform but no inventory_terraform.yml found.
+              Please provide an inventory (e.g. inventory_terraform.yml) with the EC2 hosts
+              or set inventory file manually before running the rest of the playbooks.
+          when: not tf_inventory_stat.stat.exists
+      when: (deployment_mode | default('multipass')) == 'terraform'
 
-            - name: Terraform mode - skip Multipass provisioning and use provided inventory if available
-              block:
-                - name: Check for repository inventory_terraform.yml
-                  ansible.builtin.stat:
-                    path: "{{ playbook_dir }}/../inventory_terraform.yml"
-                  register: tf_inventory_stat
+    - name: Multipass provisioning block
+      block:
+        - name: Launch Multipass instances with cloud-init
+          command: >
+            multipass launch 22.04
+            --name {{ item.name }}
+            --cpus 2
+            --memory 2G
+            --disk 10G
+            --cloud-init "{{ playbook_dir }}/cloud-init.yml"
+          loop: "{{ nodes }}"
+          register: launch_result
+          failed_when: 
+            - launch_result.rc != 0
+            - "'already exists' not in launch_result.stderr"
 
-                - name: Copy terraform inventory to inventory.yml
-                  ansible.builtin.copy:
-                    src: "{{ playbook_dir }}/../inventory_terraform.yml"
-                    dest: "{{ playbook_dir }}/../inventory.yml"
-                    remote_src: yes
-                  when: tf_inventory_stat.stat.exists
+        - name: Wait for VMs to get IP addresses
+          pause:
+            seconds: 10
 
-                - name: Warn that terraform inventory was not found
-                  ansible.builtin.debug:
-                    msg: |
-                      deployment_mode=terraform but no inventory_terraform.yml found.
-                      Please provide an inventory (e.g. inventory_terraform.yml) with the EC2 hosts
-                      or set inventory file manually before running the rest of the playbooks.
-                  when: not tf_inventory_stat.stat.exists
-              when: deployment_mode == 'terraform'
+        - name: Get IP addresses for all VMs
+          command: multipass info {{ item.name }} --format json
+          loop: "{{ nodes }}"
+          register: vm_info
+          changed_when: false
 
-            - name: Multipass provisioning block
-              block:
-                - name: Launch Multipass instances with cloud-init
-                  command: >
-                    multipass launch 22.04
-                    --name {{ item.name }}
-                    --cpus 2
-                    --memory 2G
-                    --disk 10G
-                    --cloud-init "{{ playbook_dir }}/cloud-init.yml"
-                  loop: "{{ nodes }}"
-                  register: launch_result
-                  failed_when: 
-                    - launch_result.rc != 0
-                    - "'already exists' not in launch_result.stderr"
+        - name: Parse IP addresses
+          set_fact:
+            vm_ips: >-
+              {{
+                vm_ips | default({}) | combine({
+                  item.item.name: (item.stdout | from_json).info[item.item.name].ipv4[0]
+                })
+              }}
+          loop: "{{ vm_info.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
 
-                - name: Wait for VMs to get IP addresses
-                  pause:
-                    seconds: 10
+        - name: Display detected IP addresses
+          debug:
+            msg: "{{ item.key }}: {{ item.value }}"
+          loop: "{{ vm_ips | dict2items }}"
 
-                - name: Get IP addresses for all VMs
-                  command: multipass info {{ item.name }} --format json
-                  loop: "{{ nodes }}"
-                  register: vm_info
-                  changed_when: false
+        - name: Generate inventory file
+          copy:
+            content: |
+              all:
+                vars:
+                  ansible_python_interpreter: /usr/bin/python3
+                  ansible_user: ubuntu
+                  ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
 
-                - name: Parse IP addresses
-                  set_fact:
-                    vm_ips: >-
-                      {{
-                        vm_ips | default({}) | combine({
-                          item.item.name: (item.stdout | from_json).info[item.item.name].ipv4[0]
-                        })
-                      }}
-                  loop: "{{ vm_info.results }}"
-                  loop_control:
-                    label: "{{ item.item.name }}"
+                children:
+                  master:
+                    hosts:
+                      k3s-master:
+                        ansible_host: {{ vm_ips['k3s-master'] }}
+                  workers:
+                    hosts:
+                      k3s-worker-1:
+                        ansible_host: {{ vm_ips['k3s-worker-1'] }}
+                      k3s-worker-2:
+                        ansible_host: {{ vm_ips['k3s-worker-2'] }}
+            dest: "{{ playbook_dir }}/../inventory.yml"
 
-                - name: Display detected IP addresses
-                  debug:
-                    msg: "{{ item.key }}: {{ item.value }}"
-                  loop: "{{ vm_ips | dict2items }}"
-
-                - name: Generate inventory file
-                  copy:
-                    content: |
-                      all:
-                        vars:
-                          ansible_python_interpreter: /usr/bin/python3
-                          ansible_user: ubuntu
-                          ansible_ssh_private_key_file: ~/.ssh/multipass_id_rsa
-
-                        children:
-                          master:
-                            hosts:
-                              k3s-master:
-                                ansible_host: {{ vm_ips['k3s-master'] }}
-                          workers:
-                            hosts:
-                              k3s-worker-1:
-                                ansible_host: {{ vm_ips['k3s-worker-1'] }}
-                              k3s-worker-2:
-                                ansible_host: {{ vm_ips['k3s-worker-2'] }}
-                  dest: "{{ playbook_dir }}/../inventory.yml"
-
-                - name: Inventory file updated
-                  debug:
-                    msg: "Inventory file has been updated with the following IPs: {{ vm_ips }}"
-              when: deployment_mode != 'terraform'
+        - name: Inventory file updated
+          debug:
+            msg: "Inventory file has been updated with the following IPs: {{ vm_ips }}"
+      when: (deployment_mode | default('multipass')) != 'terraform'

@@ -1,0 +1,74 @@
+---
+# Playbook: deploy-terraform.yml
+# Purpose: Deploy K3s cluster on pre-provisioned EC2 instances (Terraform mode)
+# Usage: ansible-playbook playbooks/deploy-terraform.yml
+# 
+# Prerequisites:
+# 1. EC2 instances already created with Terraform
+# 2. inventory.yml updated with EC2 instance IPs (done by provision.yml -e deployment_mode=terraform)
+# 3. SSH keys properly configured for EC2 access
+
+- name: Verify connectivity to EC2 instances
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Test SSH connectivity to all nodes
+      ansible.builtin.ping:
+      
+    - name: Display target nodes
+      ansible.builtin.debug:
+        msg: "Successfully connected to {{ inventory_hostname }} ({{ ansible_host }})"
+
+- name: Prepare all nodes with common configuration
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - common
+
+- name: Setup K3s control plane
+  import_playbook: control-plane.yml
+
+- name: Join worker nodes to cluster
+  import_playbook: join-workers.yml
+
+- name: Verify cluster deployment
+  hosts: master
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Get cluster nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: cluster_nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Get cluster pods
+      ansible.builtin.command: kubectl get pods --all-namespaces
+      register: cluster_pods
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║          K3S TERRAFORM DEPLOYMENT COMPLETE            ║
+          ╚════════════════════════════════════════════════════════╝
+
+          Master Node: {{ ansible_host }}
+
+          Cluster Nodes:
+          {{ cluster_nodes.stdout }}
+
+          Cluster Pods:
+          {{ cluster_pods.stdout }}
+
+          Access your cluster:
+          ssh {{ ansible_user }}@{{ ansible_host }} sudo kubectl get nodes
+          ssh {{ ansible_user }}@{{ ansible_host }} sudo kubectl get pods -A
+
+          Next steps:
+          - Deploy applications: kubectl apply -f your-app.yaml
+          - Check health: ansible-playbook playbooks/health.yml
+          - Scale cluster: ansible-playbook playbooks/scale.yml -e "action=add node_count=1"

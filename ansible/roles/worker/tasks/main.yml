@@ -8,7 +8,7 @@
 
 - name: Get master IP from inventory
   set_fact:
-    master_ip: "{{ hostvars['k3s-master']['ansible_host'] }}"
+    master_ip: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
 
 - name: Join worker to cluster
   shell: |
@@ -16,3 +16,6 @@
     K3S_TOKEN={{ tokenfile.content | b64decode | trim }} sh -
   args:
     creates: /usr/local/bin/k3s-agent
+  timeout: 300
+  retries: 2
+  delay: 30

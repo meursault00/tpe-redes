@@ -2,16 +2,36 @@
 # Role: common
 # Purpose: Configure common dependencies and settings for all k3s nodes
 
+- name: Wait for automatic system updates to complete
+  ansible.builtin.shell: |
+    while pgrep -x apt-get > /dev/null || pgrep -x dpkg > /dev/null || pgrep -x unattended-upgrades > /dev/null; do
+      echo "Waiting for automatic updates to complete..."
+      sleep 10
+    done
+  timeout: 180
+  changed_when: false
+
 - name: Update apt cache
   ansible.builtin.apt:
     update_cache: yes
     cache_valid_time: 3600
+  timeout: 120
+  retries: 3
+  delay: 10
 
-- name: Install required packages
+- name: Install required packages (minimal set for faster installation)
   ansible.builtin.apt:
     name:
       - curl
       - wget
+    state: present
+  timeout: 120
+  retries: 3
+  delay: 10
+
+- name: Install additional packages (nice-to-have)
+  ansible.builtin.apt:
+    name:
       - vim
       - git
       - htop
@@ -20,6 +40,10 @@
       - ca-certificates
       - software-properties-common
     state: present
+  timeout: 180
+  retries: 2
+  delay: 15
+  ignore_errors: true  # Don't fail if these optional packages can't be installed
 
 - name: Configure system timezone
   community.general.timezone:

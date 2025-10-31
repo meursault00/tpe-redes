@@ -1,0 +1,113 @@
+---
+# Playbook: cleanup-terraform.yml
+# Purpose: Completely clean EC2 instances to start fresh
+# Usage: ansible-playbook playbooks/cleanup-terraform.yml
+
+- name: Cleanup EC2 instances for fresh start
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Test connectivity before cleanup
+      ansible.builtin.ping:
+      ignore_errors: true
+
+    - name: Stop and disable k3s services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - k3s
+        - k3s-agent
+      ignore_errors: true
+
+    - name: Kill any running k3s processes
+      ansible.builtin.shell: |
+        pkill -f k3s || true
+        pkill -f containerd || true
+      ignore_errors: true
+
+    - name: Remove k3s installation
+      ansible.builtin.shell: |
+        if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+          /usr/local/bin/k3s-uninstall.sh
+        fi
+        if [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then
+          /usr/local/bin/k3s-agent-uninstall.sh
+        fi
+      ignore_errors: true
+
+    - name: Remove k3s directories and files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/rancher/k3s
+        - /var/lib/rancher/k3s
+        - /var/log/k3s
+        - /usr/local/bin/k3s
+        - /usr/local/bin/kubectl
+        - /usr/local/bin/crictl
+        - /usr/local/bin/ctr
+      ignore_errors: true
+
+    - name: Clean up systemd files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/k3s.service
+        - /etc/systemd/system/k3s-agent.service
+        - /etc/systemd/system/k3s.service.env
+      ignore_errors: true
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+      ignore_errors: true
+
+    - name: Clean up any Docker/containerd resources
+      ansible.builtin.shell: |
+        docker system prune -af || true
+        crictl rmi --prune || true
+      ignore_errors: true
+
+    - name: Reset iptables rules
+      ansible.builtin.shell: |
+        iptables -F || true
+        iptables -t nat -F || true
+        iptables -t mangle -F || true
+        iptables -X || true
+      ignore_errors: true
+
+    - name: Remove any leftover network interfaces
+      ansible.builtin.shell: |
+        ip link delete cni0 || true
+        ip link delete flannel.1 || true
+      ignore_errors: true
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg: "✅ {{ inventory_hostname }} has been cleaned up and is ready for fresh deployment"
+
+- name: Remove local join token
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Remove join token file
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/join-token.txt"
+        state: absent
+      ignore_errors: true
+
+    - name: Display cleanup completion
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════╗
+          ║              CLEANUP COMPLETED                         ║
+          ╚════════════════════════════════════════════════════════╝
+          
+          All EC2 instances have been cleaned up.
+          You can now run: ansible-playbook playbooks/deploy-terraform.yml
