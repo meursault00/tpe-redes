@@ -114,18 +114,22 @@ git push -u origin main
 For cloud deployment using Terraform-provisioned EC2 instances:
 
 ```bash
-# 1. Ensure EC2 instances are running and you have IPs + SSH key (.pem)
+# 1. Ensure EC2 instances are running with proper security groups
+#    - SSH (port 22) allowed from your IP
+#    - Inter-instance communication enabled
+#    - Kubernetes API (port 6443) accessible between nodes
 
-# 2. Create inventory_terraform.yml in repo root (see docs/GETTING_STARTED.md for example)
+# 2. Create inventory_terraform.yml with your EC2 IPs and SSH key:
+#    ansible_ssh_private_key_file: ~/.ssh/master-key.pem
 
-# 3. Provision (skip VM creation)
+# 3. Provision (test connectivity and copy inventory)
 ansible-playbook ansible/playbooks/provision.yml -e deployment_mode=terraform
 
-# 4. Install k3s cluster
-ansible-playbook ansible/playbooks/install.yml
+# 4. Deploy k3s cluster to EC2
+ansible-playbook ansible/playbooks/deploy-terraform.yml
 
-# 5. Check status
-ansible-playbook ansible/playbooks/status.yml
+# 5. Verify deployment
+ansible-playbook ansible/playbooks/health.yml
 ```
 
-**Note**: Requires `inventory_terraform.yml` with EC2 IPs and SSH key path.
+**Requirements**: `inventory_terraform.yml` with EC2 IPs, `master-key.pem` in `~/.ssh/`, proper security groups.

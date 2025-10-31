@@ -23,6 +23,7 @@ This project provides a complete automation solution for deploying and managing 
 - **Intelligent inventory management**: Automatic IP detection and inventory updates
 - **Common node configuration**: Unified setup for networking requirements (IPv4 forwarding, kernel modules)
 - **Health monitoring**: Built-in verification that nodes join successfully
+- **Automated cluster watching**: Continuous monitoring with auto-recovery for failed worker nodes
 - **Complete cluster teardown**: Clean destruction of all resources
 - **Idempotent playbooks**: Safe to run multiple times without side effects
 - **Multi-environment support**: Deploy to local Multipass VMs or AWS EC2 instances via Terraform integration
@@ -98,7 +99,48 @@ ansible-playbook -i inventory.yml playbooks/scale.yml -e "action=remove node_cou
 
 **Note**: Always run scale.yml from the `ansible/` directory to ensure proper role path resolution.
 
-#### 4. Destroy Cluster
+#### 4. Monitor Cluster with Auto-Recovery
+
+Start an automated cluster watcher that continuously monitors worker node health and automatically recovers failed nodes:
+
+```bash
+cd ansible
+./scripts/watch_cluster.sh
+```
+
+This script provides:
+- **Continuous monitoring**: Checks cluster health every 10 seconds
+- **VM validation**: Verifies that worker VMs still exist in Multipass
+- **Auto-recovery**: Automatically replaces failed worker nodes using the scale.yml playbook
+- **Failure tracking**: Tracks consecutive failures before triggering recovery
+- **Periodic health reports**: Runs health.yml every 60 seconds for detailed reporting
+
+**How it works**:
+Just like Kubernetes monitors pods and recreates them when they fail, our cluster watcher monitors the Multipass VMs that act as cluster nodes. While it can't handle master node failures, it provides automatic recovery for worker nodes:
+
+1. **Detection**: Monitors `kubectl get nodes` and `multipass list` to detect missing/failed workers
+2. **Validation**: Uses a failure counter to avoid false positives (3 consecutive failures required)
+3. **Recovery**: When a worker VM dies or becomes unresponsive:
+   - Removes the dead node from the k3s cluster
+   - Deletes the failed VM from Multipass
+   - Runs `scale.yml` to create a replacement worker
+   - New worker automatically joins the cluster
+
+This provides a "homemade" version of Kubernetes' self-healing capabilities at the infrastructure level, ensuring your cluster maintains the desired number of worker nodes even if VMs crash unexpectedly.
+
+**Usage**:
+```bash
+# Start the watcher (runs indefinitely)
+cd ansible
+./scripts/watch_cluster.sh
+
+# Monitor output for health status and auto-recovery actions
+# Press Ctrl+C to stop monitoring
+```
+
+**Note**: The watcher should be run from the Ansible control node (your local machine) and requires the cluster to be already deployed.
+
+#### 5. Destroy Cluster
 
 Clean up all resources:
 
@@ -113,16 +155,130 @@ This will:
 - Purge deleted VMs from Multipass
 - Reset inventory.yml to empty state
 
+## AWS/EC2 Deployment (Terraform Integration)
+
+This project also supports deploying k3s clusters to AWS EC2 instances that have been provisioned by Terraform. This workflow assumes you have EC2 instances already created and configured.
+
+### Prerequisites for AWS Deployment
+
+1. **EC2 instances created** - At least 2 instances (1 master, 1+ workers) provisioned via Terraform
+2. **Security group configuration**:
+   - **SSH access (port 22)** - Your Ansible control node's public IP must be allowed
+   - **Inter-instance communication** - All instances must be able to communicate with each other
+   - **Kubernetes API (port 6443)** - Workers must be able to reach master on this port
+   - **Kubelet (port 10250)** - For node-to-node communication
+3. **SSH key** - The generated PEM key file named `master-key.pem` in `~/.ssh/` directory
+4. **Inventory file** - Create `inventory_terraform.yml` with EC2 instance IPs
+
+### AWS Deployment Steps
+
+#### 1. Prepare Inventory File
+
+Create `ansible/inventory_terraform.yml` with your EC2 instance information:
+
+```yaml
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/master-key.pem
+  
+  children:
+    master:
+      hosts:
+        ec2-master:
+          ansible_host: YOUR_MASTER_PUBLIC_IP
+    workers:
+      hosts:
+        ec2-worker-1:
+          ansible_host: YOUR_WORKER1_PUBLIC_IP
+        ec2-worker-2:
+          ansible_host: YOUR_WORKER2_PUBLIC_IP  # Optional: add more workers as needed
+```
+
+#### 2. Provision (Copy Inventory)
+
+Test connectivity and copy the Terraform inventory to the active inventory file:
+
+```bash
+cd ansible
+ansible-playbook playbooks/provision.yml -e deployment_mode=terraform
+```
+
+This will:
+- Check for `inventory_terraform.yml`
+- Copy it to `inventory.yml` (the active inventory)
+- Skip Multipass VM creation
+
+#### 3. Deploy K3s Cluster
+
+Deploy the k3s cluster to your EC2 instances:
+
+```bash
+cd ansible
+ansible-playbook playbooks/deploy-terraform.yml
+```
+
+This will:
+- Test SSH connectivity to all EC2 instances
+- Configure common requirements (networking, kernel modules)
+- Install K3s master on the control plane node
+- Join worker nodes to the cluster
+- Verify deployment and display access instructions
+
+#### 4. Verify AWS Deployment
+
+Check your cluster status:
+
+```bash
+# SSH to master and check nodes
+ssh -i ~/.ssh/master-key.pem ubuntu@YOUR_MASTER_PUBLIC_IP sudo kubectl get nodes
+
+# Check all pods
+ssh -i ~/.ssh/master-key.pem ubuntu@YOUR_MASTER_PUBLIC_IP sudo kubectl get pods -A
+
+# Or use Ansible for verification
+ansible-playbook playbooks/health.yml
+```
+
+### Important Security Group Requirements
+
+Ensure your AWS security group allows:
+
+| Port | Protocol | Source | Description |
+|------|----------|--------|-------------|
+| 22 | TCP | Your Public IP | SSH access from Ansible control node |
+| 6443 | TCP | Security Group (self) | Kubernetes API server |
+| 10250 | TCP | Security Group (self) | Kubelet API |
+| 8472 | UDP | Security Group (self) | Flannel VXLAN |
+| All Traffic | All | Security Group (self) | Inter-node communication (recommended) |
+
+### AWS Workflow Summary
+
+```bash
+# 1. Create inventory_terraform.yml with your EC2 IPs
+# 2. Test and activate Terraform inventory
+ansible-playbook playbooks/provision.yml -e deployment_mode=terraform
+
+# 3. Deploy k3s to EC2 instances  
+ansible-playbook playbooks/deploy-terraform.yml
+
+# 4. Verify deployment
+ansible-playbook playbooks/health.yml
+```
+
+**Note**: The scaling functionality (`scale.yml`) is designed for Multipass VMs and won't work with EC2 instances. For AWS scaling, use Terraform or AWS Auto Scaling Groups.
+
 ## Project Structure
 
 ```
 .
 ├── ansible/
 │   ├── playbooks/
-│   │   ├── deploy-all.yml      # Complete cluster deployment
-│   │   ├── provision.yml       # VM provisioning (called by deploy-all.yml)
+│   │   ├── deploy-all.yml      # Complete cluster deployment (Multipass)
+│   │   ├── deploy-terraform.yml # AWS/EC2 cluster deployment (Terraform integration)
+│   │   ├── provision.yml       # VM provisioning (Multipass/Terraform modes)
 │   │   ├── scale.yml           # Dynamic cluster scaling (add/remove workers)
-│   │   ├── destroy.yml         # Complete cluster teardown
+│   │   ├── destroy.yml         # Complete cluster teardown (Multipass)
 │   │   ├── cloud-init.yml      # Cloud-init configuration for VMs
 │   │   └── join-token.txt      # K3s join token (generated, not in git)
 │   ├── roles/
@@ -135,7 +291,11 @@ This will:
 │   │   └── worker/             # K3s worker/agent setup
 │   │       └── tasks/
 │   │           └── main.yml    # K3s agent installation and join
+│   ├── scripts/
+│   │   ├── deploy.sh           # Bash version of deploy-all playbook
+│   │   └── watch_cluster.sh    # Automated cluster monitoring with worker node auto-recovery
 │   ├── inventory.yml           # Dynamic inventory (auto-updated by playbooks)
+│   ├── inventory_terraform.yml # Terraform/AWS inventory template (user-created)
 │   ├── inventory/
 │   │   └── local.ini           # Alternative static inventory format
 │   ├── ansible.cfg             # Ansible configuration
