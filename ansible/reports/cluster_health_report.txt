@@ -1,9 +1,8 @@
 Cluster Health Report
 =====================
 Nodes Ready: 3/3
-Pods Running: 6/9
+Pods Running: 7/9
 
 Unhealthy Nodes:
 
 Failed Pods:
-- kube-system   traefik-c98fdf6fb-vvs4q                   0/1   ContainerCreating   0     10s

@@ -2,6 +2,8 @@
 
 Automated Kubernetes cluster deployment and management using Ansible and k3s.
 
+> **Quick Start**: If you just want to get a cluster up and running quickly, go directly to [QUICKSTART.md](QUICKSTART.md) for streamlined deployment instructions.
+
 ## Project Information
 
 **Course**: Redes de Información (72.20) - ITBA 2C 2025
@@ -301,8 +303,9 @@ ansible-playbook playbooks/health.yml
 │   ├── ansible.cfg             # Ansible configuration
 │   └── requirements.yml        # Required Ansible collections
 ├── docs/
-│   ├── arquitectura.md         # Architecture documentation
-│   └── Pre-Entrega-Redes.pdf  # Initial proposal/PoC
+│   ├── components.md           # Cluster components and network architecture
+│   └── Enunciado-TPE.pdf       # Project instructions
+│   └── PoC.pdf                 # Initial proposal/PoC
 ├── context/                    # Assignment materials
 └── README.md                   # This file
 ```
@@ -549,7 +552,7 @@ k3s-worker-2    192.168.64.39    worker
 - **Storage**: Local-path provisioner (included with k3s)
 - **Ingress**: Traefik (included with k3s)
 
-See [docs/arquitectura.md](docs/arquitectura.md) for detailed diagrams.
+See [docs/components.md](docs/components.md) for detailed component information and network architecture.
 
 ## Configuration
 
@@ -715,7 +718,7 @@ See `.gitignore` for complete list.
 
 ## Documentation
 
-- **[Architecture](docs/arquitectura.md)** - Network diagrams and component overview
+- **[Components & Architecture](docs/components.md)** - Cluster components and network architecture details
 
 ## Technical Notes
 
@@ -727,30 +730,14 @@ The `common` role configures essential requirements for k3s on all nodes:
 - **Essential packages** - curl (required by k3s installer) and debugging tools
 
 ### Scale Playbook Design
-The `scale.yml` playbook (589 lines) handles complex dynamic scaling:
+The `scale.yml` playbook handles complex dynamic scaling:
 - **State management** - Tracks existing workers, identifies gaps in numbering
 - **Inventory manipulation** - YAML parsing, merging, automatic updates
 - **Selective configuration** - Only applies roles to new workers, skips existing
 - **Graceful operations** - Drains pods before removing workers
 - **Comprehensive validation** - Prevents invalid operations, provides clear feedback
 
-This complexity ensures reliability but could be simplified for academic purposes by reducing error handling and status displays.
-
 ### Multi-Environment Support
 - **Local Development**: Multipass VMs with automatic IP detection
 - **Cloud Deployment**: AWS EC2 integration via Terraform inventory
 - **Smart Provisioning**: Single playbook detects environment and adapts behavior
-
-## Important Dates
-
-- **Pre-entrega**: Miércoles 24 de Septiembre ✅ DONE
-- **Entrega Final**: Miércoles 5 de Noviembre
-- **Presentaciones**: Jueves 6 y Martes 11 de Noviembre
-
-## License
-
-Academic project - ITBA 2025
-
-## Support
-
-For questions or issues, contact any team member via email.
