@@ -302,7 +302,6 @@ ansible-playbook playbooks/health.yml
 │   └── requirements.yml        # Required Ansible collections
 ├── docs/
 │   ├── arquitectura.md         # Architecture documentation
-│   ├── IMPLEMENTATION.md       # Implementation decisions and justifications (NEW)
 │   └── Pre-Entrega-Redes.pdf  # Initial proposal/PoC
 ├── context/                    # Assignment materials
 └── README.md                   # This file
@@ -407,7 +406,7 @@ Prepares all nodes (master and workers) with required system configuration:
 - k3s requires specific networking configuration
 - Must be applied before k3s installation
 - Common to both master and worker nodes
-- See [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) for detailed justification
+- See Technical Notes section below for implementation details
 
 ### master
 
@@ -716,19 +715,31 @@ See `.gitignore` for complete list.
 
 ## Documentation
 
-- **[Implementation Details](docs/IMPLEMENTATION.md)** - Detailed explanation of design decisions and justifications
 - **[Architecture](docs/arquitectura.md)** - Network diagrams and component overview
-- **[Pre-entrega PoC](docs/Pre-Entrega-Redes.pdf)** - Initial proposal
 
-## Key Design Decisions
+## Technical Notes
 
-For detailed justifications of implementation choices, see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md), which covers:
+### Common Role Requirements
+The `common` role configures essential requirements for k3s on all nodes:
+- **IPv4 forwarding** (`net.ipv4.ip_forward=1`) - Required for pod-to-pod communication across nodes
+- **Kernel modules** (`br_netfilter`, `overlay`) - Required for container networking
+- **Swap disable** - Kubernetes requirement for memory management
+- **Essential packages** - curl (required by k3s installer) and debugging tools
 
-- Why we use the common role (networking requirements)
-- Why scale.yml is 589 lines (robustness vs. simplicity)
-- Why we use dynamic inventory management
-- Why destroy.yml auto-discovers VMs
-- Trade-offs between code complexity and reliability
+### Scale Playbook Design
+The `scale.yml` playbook (589 lines) handles complex dynamic scaling:
+- **State management** - Tracks existing workers, identifies gaps in numbering
+- **Inventory manipulation** - YAML parsing, merging, automatic updates
+- **Selective configuration** - Only applies roles to new workers, skips existing
+- **Graceful operations** - Drains pods before removing workers
+- **Comprehensive validation** - Prevents invalid operations, provides clear feedback
+
+This complexity ensures reliability but could be simplified for academic purposes by reducing error handling and status displays.
+
+### Multi-Environment Support
+- **Local Development**: Multipass VMs with automatic IP detection
+- **Cloud Deployment**: AWS EC2 integration via Terraform inventory
+- **Smart Provisioning**: Single playbook detects environment and adapts behavior
 
 ## Important Dates
 
